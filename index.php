@@ -40,11 +40,22 @@
     <!-- Toolbar -->
     <div class="flex items-center gap-4 mb-6">
         <input type="text" id="searchInput" placeholder="Search..." class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm w-64 focus:outline-none focus:border-blue-500" onkeydown="if(event.key==='Enter') loadCurrentTab()">
-        <select id="filterSelect" class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500" onchange="loadCurrentTab()">
+        <select id="filterSelect" class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500" onchange="onFilterChange()">
             <option value="">All</option>
         </select>
+        <select id="perPageSelect" class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500" onchange="changePerPage()" title="Results per page">
+            <option value="25">25 / page</option>
+            <option value="50">50 / page</option>
+            <option value="100">100 / page</option>
+            <option value="200">200 / page</option>
+        </select>
         <button onclick="loadCurrentTab()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm transition">Load</button>
-        <div id="statusMsg" class="text-sm text-gray-400 ml-auto"></div>
+        <div id="installsTotalBadge" class="hidden ml-auto text-sm bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
+            <span class="text-gray-500">Total sites:</span>
+            <span id="installsTotalValue" class="text-white font-semibold ml-1">—</span>
+            <button onclick="refreshInstallsTotal()" title="Refresh" class="ml-2 text-gray-500 hover:text-blue-400">↻</button>
+        </div>
+        <div id="statusMsg" class="text-sm text-gray-400 ml-4"></div>
     </div>
 
     <!-- Data Table -->
@@ -92,10 +103,12 @@
 </div>
 
 <script>
-const PER_PAGE = 25;
+const perPageByTab = { users: 25, licenses: 25, subscriptions: 25, installs: 100 };
 let currentTab = 'users';
 let currentOffset = 0;
 let lastResultCount = 0;
+let installsTotalCache = null;
+const ipCache = {}; // host → ip (or null if unresolved)
 
 const filters = {
     users:         [{v:'',l:'All'},{v:'paid',l:'Paid'},{v:'paying',l:'Paying'},{v:'never_paid',l:'Never Paid'},{v:'beta',l:'Beta'}],
@@ -108,24 +121,45 @@ const headers = {
     users:         ['ID','Email','First','Last','Verified','Created','Actions'],
     licenses:      ['ID','Key','Plan ID','Quota','Activations','Expiration','Created','Actions'],
     subscriptions: ['ID','License ID','Plan ID','Gateway','Amount','Status','Next Payment','Actions'],
-    installs:      ['ID','User ID','URL','Version','License ID','Plan ID','Active','Actions'],
+    installs:      ['ID','User ID','URL','IP','Version','License ID','Plan ID','Active','Actions'],
 };
+
+// Sort key per column (null = not sortable). '__ip' = resolved-IP pseudo-field.
+const sortKeys = {
+    users:         ['id','email','first','last','is_verified','created',null],
+    licenses:      ['id','secret_key','plan_id','quota','activated','expiration','created',null],
+    subscriptions: ['id','license_id','plan_id','gateway','total_gross','cancel_date','next_payment',null],
+    installs:      ['id','user_id','url','__ip','version','license_id','plan_id','is_active',null],
+};
+
+let lastItems = [];
+let sortState = null; // { col, dir: 'asc'|'desc' } or null
 
 function switchTab(tab) {
     currentTab = tab;
     currentOffset = 0;
+    sortState = null;
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('tab-active'));
     document.getElementById('tab-' + tab).classList.add('tab-active');
 
-    // Update filters
+    // Update filters. Installs has no useful server-side filter, so we hijack
+    // this dropdown for client-side IP filtering — options are populated once
+    // the install URLs resolve.
     const sel = document.getElementById('filterSelect');
     sel.innerHTML = '';
-    filters[tab].forEach(f => {
+    if (tab === 'installs') {
         const opt = document.createElement('option');
-        opt.value = f.v;
-        opt.textContent = f.l;
+        opt.value = '';
+        opt.textContent = 'All IPs';
         sel.appendChild(opt);
-    });
+    } else {
+        filters[tab].forEach(f => {
+            const opt = document.createElement('option');
+            opt.value = f.v;
+            opt.textContent = f.l;
+            sel.appendChild(opt);
+        });
+    }
 
     // Update search placeholder
     const search = document.getElementById('searchInput');
@@ -134,14 +168,51 @@ function switchTab(tab) {
     else if (tab === 'licenses') search.placeholder = 'Search by ID or key...';
     else search.placeholder = 'Search...';
 
+    // Sync per-page select with this tab's remembered preference
+    document.getElementById('perPageSelect').value = perPageByTab[tab];
+
+    // Show the total-sites badge only on the installs tab
+    const badge = document.getElementById('installsTotalBadge');
+    if (tab === 'installs') {
+        badge.classList.remove('hidden');
+        if (installsTotalCache === null) refreshInstallsTotal();
+        else document.getElementById('installsTotalValue').textContent = installsTotalCache;
+    } else {
+        badge.classList.add('hidden');
+    }
+
+    loadCurrentTab();
+}
+
+function refreshInstallsTotal() {
+    const valEl = document.getElementById('installsTotalValue');
+    valEl.textContent = '…';
+    fetch('api.php?action=count_installs')
+        .then(r => r.json())
+        .then(res => {
+            if (res.success) {
+                installsTotalCache = res.data.total;
+                valEl.textContent = installsTotalCache;
+            } else {
+                valEl.textContent = '?';
+            }
+        })
+        .catch(() => { valEl.textContent = '?'; });
+}
+
+function changePerPage() {
+    const val = parseInt(document.getElementById('perPageSelect').value, 10);
+    perPageByTab[currentTab] = val;
+    currentOffset = 0;
     loadCurrentTab();
 }
 
 function loadCurrentTab() {
     const search = document.getElementById('searchInput').value;
     const filter = document.getElementById('filterSelect').value;
+    const perPage = perPageByTab[currentTab];
 
-    let params = `action=list_${currentTab}&count=${PER_PAGE}&offset=${currentOffset}`;
+    let params = `action=list_${currentTab}&count=${perPage}&offset=${currentOffset}`;
     if (filter) params += `&filter=${encodeURIComponent(filter)}`;
     if (search) params += `&search=${encodeURIComponent(search)}`;
 
@@ -161,27 +232,190 @@ function loadCurrentTab() {
 }
 
 function renderTable(data) {
-    const head = document.getElementById('tableHead');
-    const body = document.getElementById('tableBody');
-
-    // Build header
-    head.innerHTML = '<tr>' + headers[currentTab].map(h => `<th class="px-4 py-3 font-medium">${h}</th>`).join('') + '</tr>';
-
-    // Determine the collection key
     const key = currentTab;
-    const items = data?.[key] || [];
-    lastResultCount = items.length;
+    lastItems = data?.[key] || [];
+    lastResultCount = lastItems.length;
 
-    if (!items.length) {
-        body.innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
+    renderTableHeaders();
+
+    if (!lastItems.length) {
+        document.getElementById('tableBody').innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
         setStatus('0 results');
         updatePagination();
         return;
     }
 
-    body.innerHTML = items.map(item => renderRow(item)).join('');
-    setStatus(`${items.length} results (offset ${currentOffset})`);
+    applyViewAndRender();
+    setStatus(`${lastItems.length} results (offset ${currentOffset})`);
     updatePagination();
+
+    if (currentTab === 'installs') populateInstallIps(lastItems);
+}
+
+function renderTableHeaders() {
+    const head = document.getElementById('tableHead');
+    const keys = sortKeys[currentTab];
+    head.innerHTML = '<tr>' + headers[currentTab].map((h, i) => {
+        const k = keys[i];
+        if (!k) return `<th class="px-4 py-3 font-medium">${h}</th>`;
+        const arrow = sortState && sortState.col === k
+            ? (sortState.dir === 'asc' ? ' <span class="text-blue-400">↑</span>' : ' <span class="text-blue-400">↓</span>')
+            : ' <span class="text-gray-700">↕</span>';
+        return `<th class="px-4 py-3 font-medium cursor-pointer select-none hover:text-blue-400" onclick="onHeaderClick(${i})">${h}${arrow}</th>`;
+    }).join('') + '</tr>';
+}
+
+function onHeaderClick(colIdx) {
+    const key = sortKeys[currentTab][colIdx];
+    if (!key) return;
+    if (sortState && sortState.col === key) {
+        sortState.dir = sortState.dir === 'asc' ? 'desc' : 'asc';
+    } else {
+        sortState = { col: key, dir: 'asc' };
+    }
+    renderTableHeaders();
+    applyViewAndRender();
+}
+
+function onFilterChange() {
+    if (currentTab === 'installs') {
+        applyViewAndRender();
+    } else {
+        loadCurrentTab();
+    }
+}
+
+function applyViewAndRender() {
+    let items = lastItems.slice();
+
+    // Client-side IP filter (installs only)
+    if (currentTab === 'installs') {
+        const ipFilter = document.getElementById('filterSelect').value;
+        if (ipFilter) {
+            items = items.filter(it => ipCache[hostOf(it.url)] === ipFilter);
+        }
+    }
+
+    // Sort
+    if (sortState) {
+        const dir = sortState.dir === 'asc' ? 1 : -1;
+        const col = sortState.col;
+        items.sort((a, b) => compareValues(sortValue(a, col), sortValue(b, col)) * dir);
+    }
+
+    const body = document.getElementById('tableBody');
+    if (!items.length) {
+        body.innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
+        return;
+    }
+    body.innerHTML = items.map(item => renderRow(item)).join('');
+}
+
+function hostOf(url) {
+    try { return new URL(url).hostname; } catch (_) { return ''; }
+}
+
+function sortValue(item, col) {
+    if (col === '__ip') return ipCache[hostOf(item.url)] || '';
+    return item[col];
+}
+
+function compareValues(a, b) {
+    const aMissing = a == null || a === '';
+    const bMissing = b == null || b === '';
+    if (aMissing && bMissing) return 0;
+    if (aMissing) return 1;  // missing sorts last (in asc)
+    if (bMissing) return -1;
+
+    // IPv4 numeric ordering
+    const ipRe = /^\d+\.\d+\.\d+\.\d+$/;
+    if (ipRe.test(a) && ipRe.test(b)) {
+        const ap = a.split('.').map(Number);
+        const bp = b.split('.').map(Number);
+        for (let i = 0; i < 4; i++) if (ap[i] !== bp[i]) return ap[i] - bp[i];
+        return 0;
+    }
+
+    // Numeric compare when both sides look numeric
+    const na = Number(a), nb = Number(b);
+    if (!isNaN(na) && !isNaN(nb) && `${a}`.trim() !== '' && `${b}`.trim() !== '') {
+        return na - nb;
+    }
+    return String(a).localeCompare(String(b));
+}
+
+function populateInstallFilterOptions() {
+    if (currentTab !== 'installs') return;
+    const sel = document.getElementById('filterSelect');
+    const current = sel.value;
+    const ips = new Set();
+    lastItems.forEach(it => {
+        const ip = ipCache[hostOf(it.url)];
+        if (ip) ips.add(ip);
+    });
+    const sorted = [...ips].sort(compareValues);
+    sel.innerHTML = '<option value="">All IPs</option>' +
+        sorted.map(ip => `<option value="${ip}">${ip}</option>`).join('');
+    if (sorted.includes(current)) sel.value = current;
+}
+
+function populateInstallIps(items) {
+    // Extract host + tag each install with its host for quick cell lookup later
+    const entries = items.map(item => {
+        let host = null;
+        try { host = new URL(item.url).hostname; } catch (_) {}
+        return { id: item.id, host };
+    });
+
+    // Fill known cache hits immediately; collect unknowns for the backend
+    const toFetch = new Set();
+    entries.forEach(({ id, host }) => {
+        const cell = document.querySelector(`[data-install-ip="${id}"]`);
+        if (!cell) return;
+        if (!host) { cell.textContent = '—'; return; }
+        if (host in ipCache) {
+            cell.textContent = ipCache[host] || '—';
+        } else {
+            toFetch.add(host);
+        }
+    });
+
+    if (!toFetch.size) return;
+
+    // Chunk into parallel requests of ~10 hosts each so the page doesn't block
+    // on a slow DNS lookup — each PHP request resolves its chunk sequentially,
+    // but chunks run concurrently across separate HTTP requests.
+    const hosts = [...toFetch];
+    const chunkSize = 10;
+    for (let i = 0; i < hosts.length; i += chunkSize) {
+        const chunk = hosts.slice(i, i + chunkSize);
+        const form = new FormData();
+        chunk.forEach(h => form.append('hosts[]', h));
+
+        fetch('api.php?action=resolve_ips', { method: 'POST', body: form })
+            .then(r => r.json())
+            .then(res => {
+                if (!res.success) return;
+                Object.assign(ipCache, res.data);
+                entries.forEach(({ id, host }) => {
+                    if (!host || !(host in res.data)) return;
+                    const cell = document.querySelector(`[data-install-ip="${id}"]`);
+                    if (cell) cell.textContent = res.data[host] || '—';
+                });
+                populateInstallFilterOptions();
+                // Re-apply sort if the user is sorting by IP, since new IPs changed the order
+                if (sortState && sortState.col === '__ip') applyViewAndRender();
+            })
+            .catch(() => {
+                chunk.forEach(h => {
+                    entries.forEach(({ id, host }) => {
+                        if (host !== h) return;
+                        const cell = document.querySelector(`[data-install-ip="${id}"]`);
+                        if (cell) cell.textContent = '?';
+                    });
+                });
+            });
+    }
 }
 
 function renderRow(item) {
@@ -228,10 +462,13 @@ function renderRow(item) {
             </tr>`;
 
         case 'installs':
+            const cachedHost = hostOf(item.url);
+            const cachedIp = cachedHost in ipCache ? (ipCache[cachedHost] || '—') : '…';
             return `<tr class="hover:bg-gray-800/50 transition">
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3">${item.user_id || '-'}</td>
                 <td class="px-4 py-3 text-xs max-w-xs truncate">${esc(item.url || '-')}</td>
+                <td data-install-ip="${item.id}" class="px-4 py-3 font-mono text-xs text-gray-500">${cachedIp}</td>
                 <td class="px-4 py-3">${esc(item.version || '-')}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
                 <td class="px-4 py-3">${item.plan_id || '-'}</td>
@@ -278,7 +515,8 @@ function apiAction(params, label) {
                 setStatus(`${label} — done.`);
                 loadCurrentTab();
             } else {
-                setStatus(`Error on ${label}: ${res.error || JSON.stringify(res.data)}`);
+                const msg = res.error || res.data?.error?.message || JSON.stringify(res.data);
+                setStatus(`Error on ${label}: ${msg}`);
             }
         })
         .catch(err => setStatus('Fetch error: ' + err.message));
@@ -408,20 +646,22 @@ function closeModal() {
 // ── Pagination ──────────────────────────────────────────────────
 
 function prevPage() {
-    currentOffset = Math.max(0, currentOffset - PER_PAGE);
+    const perPage = perPageByTab[currentTab];
+    currentOffset = Math.max(0, currentOffset - perPage);
     loadCurrentTab();
 }
 
 function nextPage() {
-    currentOffset += PER_PAGE;
+    currentOffset += perPageByTab[currentTab];
     loadCurrentTab();
 }
 
 function updatePagination() {
-    const page = Math.floor(currentOffset / PER_PAGE) + 1;
+    const perPage = perPageByTab[currentTab];
+    const page = Math.floor(currentOffset / perPage) + 1;
     document.getElementById('pageInfo').textContent = `Page ${page}`;
     document.getElementById('prevBtn').disabled = currentOffset === 0;
-    document.getElementById('nextBtn').disabled = lastResultCount < PER_PAGE;
+    document.getElementById('nextBtn').disabled = lastResultCount < perPage;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────
