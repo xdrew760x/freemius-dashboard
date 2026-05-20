@@ -20,7 +20,10 @@
 <header class="bg-gray-900 border-b border-gray-800 px-6 py-4">
     <div class="max-w-7xl mx-auto flex items-center justify-between">
         <h1 class="text-xl font-bold text-white">Freemius <span class="text-blue-400">Dashboard</span></h1>
-        <span class="text-xs text-gray-500">Product #<?= (require __DIR__.'/config.php')['product_id'] ?></span>
+        <div class="flex items-center gap-3">
+            <label for="productSelect" class="text-xs text-gray-500">Product:</label>
+            <select id="productSelect" class="bg-gray-800 border border-gray-700 rounded-lg px-3 py-1.5 text-sm focus:outline-none focus:border-blue-500" onchange="changeProduct()"></select>
+        </div>
     </div>
 </header>
 
@@ -109,6 +112,7 @@ let currentOffset = 0;
 let lastResultCount = 0;
 let installsTotalCache = null;
 const ipCache = {}; // host → ip (or null if unresolved)
+let currentProductId = null; // set during init() from list_products + localStorage
 
 const filters = {
     users:         [{v:'',l:'All'},{v:'paid',l:'Paid'},{v:'paying',l:'Paying'},{v:'never_paid',l:'Never Paid'},{v:'beta',l:'Beta'}],
@@ -187,7 +191,7 @@ function switchTab(tab) {
 function refreshInstallsTotal() {
     const valEl = document.getElementById('installsTotalValue');
     valEl.textContent = '…';
-    fetch('api.php?action=count_installs')
+    fetch(`api.php?action=count_installs&product_id=${currentProductId}`)
         .then(r => r.json())
         .then(res => {
             if (res.success) {
@@ -212,7 +216,7 @@ function loadCurrentTab() {
     const filter = document.getElementById('filterSelect').value;
     const perPage = perPageByTab[currentTab];
 
-    let params = `action=list_${currentTab}&count=${perPage}&offset=${currentOffset}`;
+    let params = `action=list_${currentTab}&count=${perPage}&offset=${currentOffset}&product_id=${currentProductId}`;
     if (filter) params += `&filter=${encodeURIComponent(filter)}`;
     if (search) params += `&search=${encodeURIComponent(search)}`;
 
@@ -392,7 +396,7 @@ function populateInstallIps(items) {
         const form = new FormData();
         chunk.forEach(h => form.append('hosts[]', h));
 
-        fetch('api.php?action=resolve_ips', { method: 'POST', body: form })
+        fetch(`api.php?action=resolve_ips&product_id=${currentProductId}`, { method: 'POST', body: form })
             .then(r => r.json())
             .then(res => {
                 if (!res.success) return;
@@ -508,7 +512,7 @@ function deleteInstall(id) {
 
 function apiAction(params, label) {
     setStatus(`Processing ${label}...`);
-    fetch(`api.php?${params}`)
+    fetch(`api.php?${params}&product_id=${currentProductId}`)
         .then(r => r.json())
         .then(res => {
             if (res.success) {
@@ -531,11 +535,12 @@ function viewUser(uid) {
     content.innerHTML = '<div class="flex justify-center py-12"><div class="spinner"></div></div>';
     drawer.classList.remove('translate-x-full');
 
+    const pid = currentProductId;
     Promise.all([
-        fetch(`api.php?action=get_user&user_id=${uid}`).then(r => r.json()),
-        fetch(`api.php?action=user_licenses&user_id=${uid}`).then(r => r.json()),
-        fetch(`api.php?action=user_installs&user_id=${uid}`).then(r => r.json()),
-        fetch(`api.php?action=user_subscriptions&user_id=${uid}`).then(r => r.json()),
+        fetch(`api.php?action=get_user&user_id=${uid}&product_id=${pid}`).then(r => r.json()),
+        fetch(`api.php?action=user_licenses&user_id=${uid}&product_id=${pid}`).then(r => r.json()),
+        fetch(`api.php?action=user_installs&user_id=${uid}&product_id=${pid}`).then(r => r.json()),
+        fetch(`api.php?action=user_subscriptions&user_id=${uid}&product_id=${pid}`).then(r => r.json()),
     ]).then(([userRes, licRes, instRes, subRes]) => {
         let html = '';
         if (userRes.success && userRes.data) {
@@ -686,7 +691,54 @@ function shortDate(d) {
 }
 
 // ── Init ────────────────────────────────────────────────────────
-switchTab('users');
+
+const PRODUCT_STORAGE_KEY = 'freemius.productId';
+
+function changeProduct() {
+    const val = parseInt(document.getElementById('productSelect').value, 10);
+    if (!val || val === currentProductId) return;
+    currentProductId = val;
+    localStorage.setItem(PRODUCT_STORAGE_KEY, String(val));
+
+    // Reset every piece of cached / paged state — what we had was for the
+    // previous product and would mislead the UI if reused.
+    currentOffset = 0;
+    lastItems = [];
+    sortState = null;
+    installsTotalCache = null;
+    Object.keys(ipCache).forEach(k => delete ipCache[k]);
+
+    // Refresh the installs total if it's currently visible.
+    if (currentTab === 'installs') {
+        document.getElementById('installsTotalValue').textContent = '—';
+        refreshInstallsTotal();
+    }
+
+    loadCurrentTab();
+}
+
+function init() {
+    fetch('api.php?action=list_products')
+        .then(r => r.json())
+        .then(res => {
+            if (!res.success || !res.data?.length) {
+                setStatus('No products configured.');
+                return;
+            }
+            const sel = document.getElementById('productSelect');
+            sel.innerHTML = res.data.map(p => `<option value="${p.id}">${esc(p.label)} (#${p.id})</option>`).join('');
+
+            const saved = parseInt(localStorage.getItem(PRODUCT_STORAGE_KEY) || '', 10);
+            const valid = res.data.some(p => p.id === saved);
+            currentProductId = valid ? saved : res.data[0].id;
+            sel.value = String(currentProductId);
+
+            switchTab('users');
+        })
+        .catch(err => setStatus('Failed to load product list: ' + err.message));
+}
+
+init();
 </script>
 </body>
 </html>

@@ -6,8 +6,25 @@ $config = require __DIR__ . '/config.php';
 
 $action = $_GET['action'] ?? '';
 $base   = $config['api_base'];
-$pid    = $config['product_id'];
-$bearer = $config['bearer'];
+
+// Multi-product: every request picks a product by ?product_id=N. Unknown or
+// missing → fall back to the first configured product so direct API hits
+// during development still work.
+$products = $config['products'] ?? [];
+if (!$products) {
+    http_response_code(500);
+    echo json_encode(['success' => false, 'error' => 'No products configured in config.php']);
+    exit;
+}
+$requestedPid = (int) ($_REQUEST['product_id'] ?? 0);
+$activeProduct = null;
+foreach ($products as $p) {
+    if ((int) $p['id'] === $requestedPid) { $activeProduct = $p; break; }
+}
+if ($activeProduct === null) $activeProduct = $products[0];
+
+$pid    = (int) $activeProduct['id'];
+$bearer = $activeProduct['bearer'];
 
 function apiRequest(string $url, string $bearer, string $method = 'GET', ?array $body = null): array
 {
@@ -103,6 +120,13 @@ $filter = $_GET['filter'] ?? '';
 $search = $_GET['search'] ?? '';
 
 switch ($action) {
+    // ── Configured products (for the header dropdown) ───────────────
+    case 'list_products': {
+        $list = array_map(fn($p) => ['id' => (int) $p['id'], 'label' => $p['label']], $products);
+        echo json_encode(['success' => true, 'data' => $list]);
+        break;
+    }
+
     // ── List endpoints ──────────────────────────────────────────────
     case 'list_users': {
         $q = ['count' => $count, 'offset' => $offset];
