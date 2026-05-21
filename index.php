@@ -12,6 +12,8 @@
         @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
         .spinner { border: 3px solid #e5e7eb; border-top-color: #3b82f6; border-radius: 50%; width: 24px; height: 24px; animation: spin 0.6s linear infinite; display: inline-block; }
         @keyframes spin { to { transform: rotate(360deg); } }
+        /* Cross-product mode is read-only: hide per-row action cells (always the last <td>). */
+        body.all-products-mode #tableBody td:last-child { visibility: hidden; }
     </style>
 </head>
 <body class="bg-gray-950 text-gray-200 min-h-screen">

@@ -4,7 +4,10 @@ let currentOffset = 0;
 let lastResultCount = 0;
 let installsTotalCache = null;
 const ipCache = {}; // host → ip (or null if unresolved)
-let currentProductId = null; // set during init() from list_products + localStorage
+let currentProductId = null; // numeric id, or the string 'all' for cross-product mode
+let configuredProducts = []; // [{id, label}] populated by init() from list_products
+const productLookup = {};    // id → label, same data flattened for row tagging
+const ALL_PRODUCTS = 'all';
 
 const filters = {
     users:         [{v:'',l:'All'},{v:'paid',l:'Paid'},{v:'paying',l:'Paying'},{v:'never_paid',l:'Never Paid'},{v:'beta',l:'Beta'}],
@@ -91,12 +94,13 @@ function switchTab(tab) {
     // Sync per-page select with this tab's remembered preference
     document.getElementById('perPageSelect').value = perPageByTab[tab];
 
-    // Tab-specific action buttons
-    document.getElementById('newCouponBtn').classList.toggle('hidden', tab !== 'coupons');
+    // Tab-specific action buttons — also suppressed in cross-product mode.
+    const readOnly = currentProductId === ALL_PRODUCTS;
+    document.getElementById('newCouponBtn').classList.toggle('hidden', tab !== 'coupons' || readOnly);
 
-    // Show the total-sites badge only on the installs tab
+    // Total-sites badge: installs tab AND single product only (the badge counts one product).
     const badge = document.getElementById('installsTotalBadge');
-    if (tab === 'installs') {
+    if (tab === 'installs' && currentProductId !== ALL_PRODUCTS) {
         badge.classList.remove('hidden');
         if (installsTotalCache === null) refreshInstallsTotal();
         else document.getElementById('installsTotalValue').textContent = installsTotalCache;
@@ -138,12 +142,41 @@ function loadCurrentTab() {
     const filter = document.getElementById('filterSelect').value;
     const perPage = perPageByTab[currentTab];
 
+    setStatus('Loading...');
+    setTableLoading();
+
+    if (currentProductId === ALL_PRODUCTS) {
+        // Fan out to each product. We accept that pagination doesn't translate
+        // cleanly here — fetch one page per product at the current per-page count.
+        const baseParams = [];
+        if (filter) baseParams.push(`filter=${encodeURIComponent(filter)}`);
+        if (search) baseParams.push(`search=${encodeURIComponent(search)}`);
+
+        const fetches = configuredProducts.map(p => {
+            const params = [`action=list_${currentTab}`, `count=${perPage}`, `offset=${currentOffset}`, `product_id=${p.id}`, ...baseParams];
+            return fetch(`api.php?${params.join('&')}`)
+                .then(r => r.json())
+                .then(res => ({ p, res }));
+        });
+        Promise.all(fetches).then(results => {
+            const merged = { [currentTab]: [] };
+            results.forEach(({ p, res }) => {
+                if (!res.success) return;
+                const items = res.data?.[currentTab] || [];
+                items.forEach(it => {
+                    it._product_id = p.id;
+                    it._product_label = p.label;
+                });
+                merged[currentTab].push(...items);
+            });
+            renderTable(merged);
+        }).catch(err => setStatus('Fetch error: ' + err.message));
+        return;
+    }
+
     let params = `action=list_${currentTab}&count=${perPage}&offset=${currentOffset}&product_id=${currentProductId}`;
     if (filter) params += `&filter=${encodeURIComponent(filter)}`;
     if (search) params += `&search=${encodeURIComponent(search)}`;
-
-    setStatus('Loading...');
-    setTableLoading();
 
     fetch(`api.php?${params}`)
         .then(r => r.json())
@@ -189,9 +222,13 @@ function renderTableHeaders() {
             : ' <span class="text-gray-700">↕</span>';
         return `<th class="px-4 py-3 font-medium cursor-pointer select-none hover:text-blue-400" onclick="onHeaderClick(${i})">${h}${arrow}</th>`;
     });
-    // Master checkbox column on bulk-capable tabs.
-    if (bulkSelectableTabs.has(currentTab)) {
+    // Master checkbox column on bulk-capable tabs (single-product mode only).
+    if (bulkSelectableTabs.has(currentTab) && currentProductId !== ALL_PRODUCTS) {
         cols.unshift(`<th class="px-4 py-3 w-8"><input type="checkbox" id="bulkMaster" onchange="toggleBulkAll(this.checked)"></th>`);
+    }
+    // Product column on all-products mode.
+    if (currentProductId === ALL_PRODUCTS) {
+        cols.unshift(`<th class="px-4 py-3 font-medium">Product</th>`);
     }
     head.innerHTML = '<tr>' + cols.join('') + '</tr>';
     updateBulkMasterState();
@@ -250,14 +287,22 @@ function applyViewAndRender() {
     updateBulkMasterState();
 }
 
-// Wraps renderRow to prepend a per-row checkbox cell on bulk-capable tabs.
+// Wraps renderRow to prepend per-row "leading" cells: bulk checkbox and/or
+// Product label, depending on mode. Order matches the header order above.
 function renderRowWithBulk(item) {
-    const row = renderRow(item);
-    if (!bulkSelectableTabs.has(currentTab)) return row;
-    const sid = String(item.id);
-    const checked = bulkSelectedIds.has(sid) ? 'checked' : '';
-    const cell = `<td class="px-4 py-3 w-8"><input type="checkbox" data-bulk-id="${sid}" onchange="toggleBulkSelect('${sid}', this.checked)" ${checked}></td>`;
-    return row.replace(/<tr ([^>]*)>/, `<tr $1>${cell}`);
+    let row = renderRow(item);
+    const leading = [];
+    if (bulkSelectableTabs.has(currentTab) && currentProductId !== ALL_PRODUCTS) {
+        const sid = String(item.id);
+        const checked = bulkSelectedIds.has(sid) ? 'checked' : '';
+        leading.push(`<td class="px-4 py-3 w-8"><input type="checkbox" data-bulk-id="${sid}" onchange="toggleBulkSelect('${sid}', this.checked)" ${checked}></td>`);
+    }
+    if (currentProductId === ALL_PRODUCTS) {
+        const label = item._product_label || `#${item._product_id ?? '?'}`;
+        leading.unshift(`<td class="px-4 py-3 text-xs text-blue-300">${esc(label)}</td>`);
+    }
+    if (!leading.length) return row;
+    return row.replace(/<tr ([^>]*)>/, `<tr $1>${leading.join('')}`);
 }
 
 function hostOf(url) {
@@ -384,7 +429,7 @@ function renderRow(item) {
             return `<tr class="hover:bg-gray-800/50 transition">
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3 font-mono text-xs">${esc((item.secret_key || '').substring(0, 20))}...</td>
-                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id, item._product_id)}</td>
                 <td class="px-4 py-3">${item.quota || 'Unlimited'}</td>
                 <td class="px-4 py-3">${item.activated ?? '-'}/${item.quota || '&infin;'}</td>
                 <td class="px-4 py-3 text-gray-500">${item.expiration ? shortDate(item.expiration) : 'Never'}</td>
@@ -402,7 +447,7 @@ function renderRow(item) {
             return `<tr class="hover:bg-gray-800/50 transition">
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
-                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id, item._product_id)}</td>
                 <td class="px-4 py-3">${esc(item.gateway || '-')}</td>
                 <td class="px-4 py-3">$${item.total_gross || '0'}</td>
                 <td class="px-4 py-3">${isActive ? '<span class="text-green-400">Active</span>' : '<span class="text-red-400">Cancelled</span>'}</td>
@@ -422,7 +467,7 @@ function renderRow(item) {
                 <td data-install-ip="${item.id}" class="px-4 py-3 font-mono text-xs text-gray-500">${cachedIp}</td>
                 <td class="px-4 py-3">${esc(item.version || '-')}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
-                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id, item._product_id)}</td>
                 <td class="px-4 py-3">${item.is_active ? '<span class="text-green-400">Yes</span>' : '<span class="text-red-400">No</span>'}</td>
                 <td class="px-4 py-3">
                     <button onclick="deleteInstall(${item.id})" class="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded transition">Delete</button>
@@ -462,7 +507,7 @@ function renderRow(item) {
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3">${item.user_id ? `<button onclick="viewUser(${item.user_id})" class="text-blue-400 hover:underline">${item.user_id}</button>` : '-'}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
-                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id, item._product_id)}</td>
                 <td class="px-4 py-3">$${gross}${refundBadge}</td>
                 <td class="px-4 py-3">${esc(item.gateway || '-')}</td>
                 <td class="px-4 py-3">${item.is_renewal ? '<span class="text-blue-400">Renewal</span>' : '<span class="text-green-400">Initial</span>'}</td>
@@ -1111,7 +1156,7 @@ function makeLifetime(licenseId) {
 
 function loadPlansForCurrentProduct() {
     const pid = currentProductId;
-    if (plansCache[pid]) return Promise.resolve();
+    if (pid === ALL_PRODUCTS || plansCache[pid]) return Promise.resolve();
     return fetch(`api.php?action=list_plans&product_id=${pid}`)
         .then(r => r.json())
         .then(res => {
@@ -1121,11 +1166,30 @@ function loadPlansForCurrentProduct() {
         .catch(() => { /* leave uncached; planLabel falls back to raw id */ });
 }
 
+// Hydrates plansCache for either the current product OR every configured product
+// when in all-products mode. Idempotent — already-cached products are skipped.
+function ensurePlansLoaded() {
+    if (currentProductId !== ALL_PRODUCTS) return loadPlansForCurrentProduct();
+    return Promise.all(configuredProducts.map(p => {
+        if (plansCache[p.id]) return Promise.resolve();
+        return fetch(`api.php?action=list_plans&product_id=${p.id}`)
+            .then(r => r.json())
+            .then(res => {
+                const arr = res?.data?.plans || [];
+                plansCache[p.id] = Object.fromEntries(arr.map(pl => [String(pl.id), pl]));
+            })
+            .catch(() => {});
+    }));
+}
+
 // Returns "Title #id" if plans are cached, just "#id" otherwise. Items
-// missing a plan render as "-".
-function planLabel(planId) {
+// missing a plan render as "-". Accepts an optional ownerProductId so rows
+// in all-products mode can look up plans against the row's own product
+// rather than the global currentProductId.
+function planLabel(planId, ownerProductId) {
     if (planId == null || planId === '') return '-';
-    const plans = plansCache[currentProductId] || {};
+    const lookupPid = ownerProductId ?? currentProductId;
+    const plans = plansCache[lookupPid] || {};
     const p = plans[String(planId)];
     if (p && p.title) {
         return `${esc(p.title)} <span class="text-gray-500 text-xs">#${planId}</span>`;
@@ -1138,8 +1202,9 @@ function planLabel(planId) {
 const PRODUCT_STORAGE_KEY = 'freemius.productId';
 
 function changeProduct() {
-    const val = parseInt(document.getElementById('productSelect').value, 10);
-    if (!val || val === currentProductId) return;
+    const raw = document.getElementById('productSelect').value;
+    const val = raw === ALL_PRODUCTS ? ALL_PRODUCTS : parseInt(raw, 10);
+    if (val === currentProductId || (val !== ALL_PRODUCTS && !val)) return;
     currentProductId = val;
     localStorage.setItem(PRODUCT_STORAGE_KEY, String(val));
 
@@ -1151,15 +1216,18 @@ function changeProduct() {
     installsTotalCache = null;
     Object.keys(ipCache).forEach(k => delete ipCache[k]);
 
-    // Refresh the installs total if it's currently visible.
-    if (currentTab === 'installs') {
+    // Toggle read-only mode (hides action buttons + tab-create buttons)
+    document.body.classList.toggle('all-products-mode', currentProductId === ALL_PRODUCTS);
+
+    // Refresh the installs total if it's currently visible AND we're on a single product.
+    if (currentTab === 'installs' && currentProductId !== ALL_PRODUCTS) {
         document.getElementById('installsTotalValue').textContent = '—';
         refreshInstallsTotal();
     }
 
     // Plans are per-product; fetch in parallel and re-render once they land
     // so the plan_id columns get enriched with titles.
-    loadPlansForCurrentProduct().then(() => { if (lastItems.length) applyViewAndRender(); });
+    ensurePlansLoaded().then(() => { if (lastItems.length) applyViewAndRender(); });
     loadCurrentTab();
 }
 
@@ -1171,15 +1239,25 @@ function init() {
                 setStatus('No products configured.');
                 return;
             }
-            const sel = document.getElementById('productSelect');
-            sel.innerHTML = res.data.map(p => `<option value="${p.id}">${esc(p.label)} (#${p.id})</option>`).join('');
+            configuredProducts = res.data;
+            res.data.forEach(p => { productLookup[String(p.id)] = p.label; });
 
-            const saved = parseInt(localStorage.getItem(PRODUCT_STORAGE_KEY) || '', 10);
-            const valid = res.data.some(p => p.id === saved);
-            currentProductId = valid ? saved : res.data[0].id;
+            const sel = document.getElementById('productSelect');
+            sel.innerHTML =
+                `<option value="${ALL_PRODUCTS}">All Products</option>` +
+                res.data.map(p => `<option value="${p.id}">${esc(p.label)} (#${p.id})</option>`).join('');
+
+            const saved = localStorage.getItem(PRODUCT_STORAGE_KEY);
+            if (saved === ALL_PRODUCTS) {
+                currentProductId = ALL_PRODUCTS;
+            } else {
+                const savedNum = parseInt(saved || '', 10);
+                const valid = res.data.some(p => p.id === savedNum);
+                currentProductId = valid ? savedNum : res.data[0].id;
+            }
             sel.value = String(currentProductId);
 
-            loadPlansForCurrentProduct().then(() => { if (lastItems.length) applyViewAndRender(); });
+            ensurePlansLoaded().then(() => { if (lastItems.length) applyViewAndRender(); });
             switchTab('users');
         })
         .catch(err => setStatus('Failed to load product list: ' + err.message));
