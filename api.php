@@ -44,7 +44,10 @@ function apiRequest(string $url, string $bearer, string $method = 'GET', ?array 
     } elseif ($method === 'POST' || $method === 'PUT') {
         curl_setopt($curl, CURLOPT_CUSTOMREQUEST, $method);
         if ($body !== null) {
-            $json = json_encode($body);
+            // JSON_FORCE_OBJECT so an empty $body serializes as {} not [] —
+            // Freemius accepts an empty object PUT as "no changes" but
+            // chokes on a top-level array.
+            $json = json_encode($body, JSON_FORCE_OBJECT);
             curl_setopt($curl, CURLOPT_POSTFIELDS, $json);
             $headers[] = 'Content-Type: application/json';
             $headers[] = 'Content-Length: ' . strlen($json);
@@ -164,33 +167,29 @@ switch ($action) {
         break;
     }
 
-    case 'test_create_license': {
-        // Probe the Freemius license-create endpoint. Reports raw response so we
-        // can see required fields / error messages without committing to the
-        // final payload shape.
-        $body = [
-            'plan_id'       => (int) ($_GET['plan_id'] ?? 0),
-            'pricing_id'    => (int) ($_GET['pricing_id'] ?? 0),
-            'user_id'       => (int) ($_GET['user_id'] ?? 0),
-            'install_id'    => (int) ($_GET['install_id'] ?? 0),
-            'quota'         => 1,
-            'billing_cycle' => 0, // 0 = lifetime in Freemius convention (1=monthly, 12=annual)
-            'expiration'    => null,
-        ];
-        $url = "{$base}/products/{$pid}/licenses.json";
-        echo json_encode([
-            'attempt_url'  => $url,
-            'attempt_body' => $body,
-            'response'     => apiRequest($url, $bearer, 'POST', $body),
-        ]);
-        break;
-    }
-
-    case 'make_license_lifetime': {
+    case 'update_license': {
         $lid = (int) ($_GET['license_id'] ?? 0);
         if (!$lid) { echo json_encode(['success' => false, 'error' => 'Missing license_id']); break; }
+
+        // Only send the fields the caller actually set, so we don't overwrite
+        // unrelated columns. The literal string "null" on expiration means
+        // "make this license lifetime" — pass real null in the JSON body.
+        $body = [];
+        if (array_key_exists('expiration', $_GET)) {
+            $body['expiration'] = $_GET['expiration'] === 'null' ? null : $_GET['expiration'];
+        }
+        foreach (['plan_id', 'pricing_id'] as $k) {
+            if (isset($_GET[$k]) && $_GET[$k] !== '') $body[$k] = (int) $_GET[$k];
+        }
+        if (array_key_exists('quota', $_GET)) {
+            $body['quota'] = $_GET['quota'] === '' || $_GET['quota'] === 'null' ? null : (int) $_GET['quota'];
+        }
+        if (isset($_GET['is_whitelabeled'])) {
+            $body['is_whitelabeled'] = $_GET['is_whitelabeled'] === '1' || $_GET['is_whitelabeled'] === 'true';
+        }
+
         $url = "{$base}/products/{$pid}/licenses/{$lid}.json";
-        echo json_encode(apiRequest($url, $bearer, 'PUT', ['expiration' => null]));
+        echo json_encode(apiRequest($url, $bearer, 'PUT', $body));
         break;
     }
 

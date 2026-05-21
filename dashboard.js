@@ -38,6 +38,14 @@ let sortState = null; // { col, dir: 'asc'|'desc' } or null
 // Plans rarely change so we keep them for the session.
 const plansCache = {};
 
+// productId → { plan_id (string) → [pricing entries] }. Filled on demand
+// by the Edit License modal so re-opening for the same plan is instant.
+const pricingCache = {};
+
+// The license object currently being edited. Used to diff against the form
+// on Save so we only PUT fields that actually changed.
+let editingLicense = null;
+
 function switchTab(tab) {
     currentTab = tab;
     currentOffset = 0;
@@ -351,6 +359,8 @@ function renderRow(item) {
                 <td class="px-4 py-3 text-gray-500">${item.expiration ? shortDate(item.expiration) : 'Never'}</td>
                 <td class="px-4 py-3 text-gray-500">${shortDate(item.created)}</td>
                 <td class="px-4 py-3 flex gap-2">
+                    <button onclick="openEditLicense(${item.id})" class="text-xs bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded transition">Edit</button>
+                    <button onclick="makeLifetime(${item.id})" class="text-xs bg-yellow-700 hover:bg-yellow-600 px-3 py-1 rounded transition" title="Set expiration to never">Lifetime</button>
                     <button onclick="cancelLicenseSub(${item.id})" class="text-xs bg-yellow-700 hover:bg-yellow-600 px-3 py-1 rounded transition" title="Cancel subscription on this license">Cancel Sub</button>
                     <button onclick="deleteLicense(${item.id})" class="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded transition">Delete</button>
                 </td>
@@ -662,6 +672,168 @@ function csvEscape(v) {
     const s = String(v);
     if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
     return s;
+}
+
+// ── Edit License ────────────────────────────────────────────────
+
+function openEditLicense(licenseId) {
+    const pid = currentProductId;
+    setStatus(`Loading license #${licenseId}...`);
+
+    Promise.all([
+        loadPlansForCurrentProduct(),
+        fetch(`api.php?action=get_license&license_id=${licenseId}&product_id=${pid}`).then(r => r.json()),
+    ]).then(([_, licRes]) => {
+        if (!licRes.success) {
+            setStatus(`Could not load license #${licenseId}: ${licRes.error || licRes.data?.error?.message || 'unknown error'}`);
+            return;
+        }
+        editingLicense = licRes.data;
+        populateEditLicensePlans(editingLicense.plan_id);
+        return loadPricingForPlan(editingLicense.plan_id).then(() => {
+            populateEditLicensePricing(editingLicense.pricing_id);
+            applyEditLicenseExpiration(editingLicense.expiration);
+            applyEditLicenseQuota(editingLicense.quota);
+            document.getElementById('editLicenseWhitelabel').checked = !!editingLicense.is_whitelabeled;
+
+            const userBit = editingLicense.user_id ? ` · user #${editingLicense.user_id}` : '';
+            document.getElementById('editLicenseInfo').textContent =
+                `#${editingLicense.id}${userBit} · created ${shortDate(editingLicense.created)}`;
+            document.getElementById('editLicenseModal').classList.remove('hidden');
+            setStatus('');
+        });
+    });
+}
+
+function closeEditLicense() {
+    document.getElementById('editLicenseModal').classList.add('hidden');
+    editingLicense = null;
+}
+
+function populateEditLicensePlans(selectedId) {
+    const sel = document.getElementById('editLicensePlan');
+    const plans = Object.values(plansCache[currentProductId] || {});
+    sel.innerHTML = plans.map(p => `<option value="${p.id}">${esc(p.title)} #${p.id}</option>`).join('');
+    sel.value = String(selectedId ?? '');
+    sel.onchange = () => {
+        loadPricingForPlan(sel.value).then(() => populateEditLicensePricing(null));
+    };
+}
+
+function loadPricingForPlan(planId) {
+    const pid = currentProductId;
+    if (!planId) return Promise.resolve();
+    if (pricingCache[pid]?.[planId]) return Promise.resolve();
+    return fetch(`api.php?action=list_pricing&plan_id=${planId}&product_id=${pid}`)
+        .then(r => r.json())
+        .then(res => {
+            (pricingCache[pid] ||= {})[planId] = res?.data?.pricing || [];
+        })
+        .catch(() => { (pricingCache[pid] ||= {})[planId] = []; });
+}
+
+function populateEditLicensePricing(selectedId) {
+    const sel = document.getElementById('editLicensePricing');
+    const planId = document.getElementById('editLicensePlan').value;
+    const entries = pricingCache[currentProductId]?.[planId] || [];
+
+    if (!entries.length) {
+        sel.innerHTML = '<option value="">(no pricing configured)</option>';
+        return;
+    }
+    sel.innerHTML = entries.map(p => {
+        const sites = p.licenses === 0 || p.licenses === null ? 'Unlimited' : `${p.licenses} site${p.licenses === 1 ? '' : 's'}`;
+        const bits = [];
+        if (p.monthly_price)  bits.push(`$${p.monthly_price}/mo`);
+        if (p.annual_price)   bits.push(`$${p.annual_price}/yr`);
+        if (p.lifetime_price) bits.push(`$${p.lifetime_price} lifetime`);
+        const label = `${sites} — ${bits.join(' / ') || 'free'}`;
+        return `<option value="${p.id}">${esc(label)} #${p.id}</option>`;
+    }).join('');
+    if (selectedId) sel.value = String(selectedId);
+}
+
+function applyEditLicenseExpiration(expiration) {
+    const lifetimeRadio = document.getElementById('editLicenseExpLifetime');
+    const dateRadio     = document.getElementById('editLicenseExpDated');
+    const dateInput     = document.getElementById('editLicenseExpDate');
+
+    if (!expiration) {
+        lifetimeRadio.checked = true;
+        dateInput.value = '';
+        dateInput.disabled = true;
+    } else {
+        dateRadio.checked = true;
+        // Freemius expirations come back as "YYYY-MM-DD HH:MM:SS"; the date
+        // input wants "YYYY-MM-DD".
+        dateInput.value = String(expiration).slice(0, 10);
+        dateInput.disabled = false;
+    }
+    lifetimeRadio.onchange = () => { dateInput.disabled = true; };
+    dateRadio.onchange     = () => { dateInput.disabled = false; dateInput.focus(); };
+}
+
+function applyEditLicenseQuota(quota) {
+    const sel = document.getElementById('editLicenseQuota');
+    if (quota == null) {
+        sel.value = 'null';
+    } else if (['1', '5', '25'].includes(String(quota))) {
+        sel.value = String(quota);
+    } else {
+        // Custom quota that doesn't match the preset list — add it transiently.
+        const opt = new Option(`${quota} sites`, String(quota), true, true);
+        sel.add(opt, 0);
+    }
+}
+
+function saveEditLicense() {
+    if (!editingLicense) return;
+    const params = ['action=update_license', `license_id=${editingLicense.id}`];
+
+    const newPlan = document.getElementById('editLicensePlan').value;
+    const newPricing = document.getElementById('editLicensePricing').value;
+    const planChanged = String(editingLicense.plan_id) !== newPlan;
+    const pricingChanged = String(editingLicense.pricing_id) !== newPricing;
+    // If the plan changed, the old pricing_id is from the wrong plan — force-send
+    // the new pricing along with the new plan even if the pricing select wasn't touched.
+    if (planChanged || pricingChanged) {
+        if (planChanged) params.push(`plan_id=${encodeURIComponent(newPlan)}`);
+        params.push(`pricing_id=${encodeURIComponent(newPricing)}`);
+    }
+
+    const lifetime = document.getElementById('editLicenseExpLifetime').checked;
+    const newExp = lifetime ? null : document.getElementById('editLicenseExpDate').value;
+    const currentExp = editingLicense.expiration ? String(editingLicense.expiration).slice(0, 10) : null;
+    if (lifetime && editingLicense.expiration !== null) {
+        params.push('expiration=null');
+    } else if (!lifetime && newExp && newExp !== currentExp) {
+        params.push(`expiration=${encodeURIComponent(newExp + ' 23:59:59')}`);
+    }
+
+    const newQuotaRaw = document.getElementById('editLicenseQuota').value;
+    const newQuota = newQuotaRaw === 'null' ? null : parseInt(newQuotaRaw, 10);
+    const currentQuota = editingLicense.quota == null ? null : parseInt(editingLicense.quota, 10);
+    if (newQuota !== currentQuota) {
+        params.push(`quota=${newQuotaRaw === 'null' ? 'null' : newQuotaRaw}`);
+    }
+
+    const newWhite = document.getElementById('editLicenseWhitelabel').checked;
+    if (newWhite !== !!editingLicense.is_whitelabeled) {
+        params.push(`is_whitelabeled=${newWhite ? '1' : '0'}`);
+    }
+
+    closeEditLicense();
+    if (params.length === 2) {
+        setStatus('No changes to save.');
+        return;
+    }
+    apiAction(params.join('&'), `License #${editingLicense.id}`);
+}
+
+function makeLifetime(licenseId) {
+    showConfirm(`Make license #${licenseId} lifetime (clear expiration)?`, () => {
+        apiAction(`action=update_license&license_id=${licenseId}&expiration=null`, `License #${licenseId}`);
+    });
 }
 
 function loadPlansForCurrentProduct() {

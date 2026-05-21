@@ -85,6 +85,52 @@
     </div>
 </main>
 
+<!-- Edit License Modal -->
+<div id="editLicenseModal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 hidden">
+    <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-lg w-full mx-4">
+        <h3 class="text-lg font-semibold text-white mb-1">Edit License</h3>
+        <p id="editLicenseInfo" class="text-xs text-gray-500 mb-5">&nbsp;</p>
+
+        <div class="space-y-4 text-sm">
+            <div>
+                <label class="block text-gray-400 mb-1">Plan</label>
+                <select id="editLicensePlan" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500"></select>
+            </div>
+            <div>
+                <label class="block text-gray-400 mb-1">Pricing</label>
+                <select id="editLicensePricing" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500"></select>
+            </div>
+            <div>
+                <label class="block text-gray-400 mb-1">Expiration</label>
+                <div class="flex items-center gap-4">
+                    <label class="flex items-center gap-1.5"><input type="radio" name="editLicenseExp" id="editLicenseExpLifetime" value="lifetime"> <span>Lifetime</span></label>
+                    <label class="flex items-center gap-1.5"><input type="radio" name="editLicenseExp" id="editLicenseExpDated" value="date"> <span>Date:</span></label>
+                    <input type="date" id="editLicenseExpDate" class="bg-gray-800 border border-gray-700 rounded-lg px-2 py-1 disabled:opacity-40">
+                </div>
+            </div>
+            <div class="flex gap-4">
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Quota</label>
+                    <select id="editLicenseQuota" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                        <option value="1">1 site</option>
+                        <option value="5">5 sites</option>
+                        <option value="25">25 sites</option>
+                        <option value="null">Unlimited</option>
+                    </select>
+                </div>
+                <div class="flex-1 flex items-end pb-1">
+                    <label class="flex items-center gap-2"><input type="checkbox" id="editLicenseWhitelabel"> <span>Whitelabel</span></label>
+                </div>
+            </div>
+        </div>
+
+        <div class="flex justify-end gap-3 mt-6">
+            <button onclick="closeEditLicense()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">Cancel</button>
+            <button id="editLicenseSaveBtn" onclick="saveEditLicense()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm text-white transition">Save Changes</button>
+        </div>
+    </div>
+</div>
+
 <!-- Confirm Modal -->
 <div id="confirmModal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 hidden">
     <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-md w-full mx-4">
