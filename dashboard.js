@@ -31,6 +31,10 @@ const sortKeys = {
 let lastItems = [];
 let sortState = null; // { col, dir: 'asc'|'desc' } or null
 
+// productId → { plan_id (string) → plan object } — populated lazily.
+// Plans rarely change so we keep them for the session.
+const plansCache = {};
+
 function switchTab(tab) {
     currentTab = tab;
     currentOffset = 0;
@@ -331,7 +335,7 @@ function renderRow(item) {
             return `<tr class="hover:bg-gray-800/50 transition">
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3 font-mono text-xs">${esc((item.secret_key || '').substring(0, 20))}...</td>
-                <td class="px-4 py-3">${item.plan_id || '-'}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
                 <td class="px-4 py-3">${item.quota || 'Unlimited'}</td>
                 <td class="px-4 py-3">${item.activated ?? '-'}/${item.quota || '&infin;'}</td>
                 <td class="px-4 py-3 text-gray-500">${item.expiration ? shortDate(item.expiration) : 'Never'}</td>
@@ -347,7 +351,7 @@ function renderRow(item) {
             return `<tr class="hover:bg-gray-800/50 transition">
                 <td class="px-4 py-3">${item.id}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
-                <td class="px-4 py-3">${item.plan_id || '-'}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
                 <td class="px-4 py-3">${esc(item.gateway || '-')}</td>
                 <td class="px-4 py-3">$${item.total_gross || '0'}</td>
                 <td class="px-4 py-3">${isActive ? '<span class="text-green-400">Active</span>' : '<span class="text-red-400">Cancelled</span>'}</td>
@@ -367,7 +371,7 @@ function renderRow(item) {
                 <td data-install-ip="${item.id}" class="px-4 py-3 font-mono text-xs text-gray-500">${cachedIp}</td>
                 <td class="px-4 py-3">${esc(item.version || '-')}</td>
                 <td class="px-4 py-3">${item.license_id || '-'}</td>
-                <td class="px-4 py-3">${item.plan_id || '-'}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
                 <td class="px-4 py-3">${item.is_active ? '<span class="text-green-400">Yes</span>' : '<span class="text-red-400">No</span>'}</td>
                 <td class="px-4 py-3">
                     <button onclick="deleteInstall(${item.id})" class="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded transition">Delete</button>
@@ -582,6 +586,30 @@ function shortDate(d) {
     return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
 }
 
+function loadPlansForCurrentProduct() {
+    const pid = currentProductId;
+    if (plansCache[pid]) return Promise.resolve();
+    return fetch(`api.php?action=list_plans&product_id=${pid}`)
+        .then(r => r.json())
+        .then(res => {
+            const arr = res?.data?.plans || [];
+            plansCache[pid] = Object.fromEntries(arr.map(p => [String(p.id), p]));
+        })
+        .catch(() => { /* leave uncached; planLabel falls back to raw id */ });
+}
+
+// Returns "Title #id" if plans are cached, just "#id" otherwise. Items
+// missing a plan render as "-".
+function planLabel(planId) {
+    if (planId == null || planId === '') return '-';
+    const plans = plansCache[currentProductId] || {};
+    const p = plans[String(planId)];
+    if (p && p.title) {
+        return `${esc(p.title)} <span class="text-gray-500 text-xs">#${planId}</span>`;
+    }
+    return `#${planId}`;
+}
+
 // ── Init ────────────────────────────────────────────────────────
 
 const PRODUCT_STORAGE_KEY = 'freemius.productId';
@@ -606,6 +634,9 @@ function changeProduct() {
         refreshInstallsTotal();
     }
 
+    // Plans are per-product; fetch in parallel and re-render once they land
+    // so the plan_id columns get enriched with titles.
+    loadPlansForCurrentProduct().then(() => { if (lastItems.length) applyViewAndRender(); });
     loadCurrentTab();
 }
 
@@ -625,6 +656,7 @@ function init() {
             currentProductId = valid ? saved : res.data[0].id;
             sel.value = String(currentProductId);
 
+            loadPlansForCurrentProduct().then(() => { if (lastItems.length) applyViewAndRender(); });
             switchTab('users');
         })
         .catch(err => setStatus('Failed to load product list: ' + err.message));
