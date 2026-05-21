@@ -54,6 +54,7 @@
             <option value="200">200 / page</option>
         </select>
         <button onclick="loadCurrentTab()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm transition">Load</button>
+        <button onclick="exportCsv()" class="bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 px-4 py-2 rounded-lg text-sm transition" title="Export current view to CSV">Export CSV</button>
         <div id="installsTotalBadge" class="hidden ml-auto text-sm bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
             <span class="text-gray-500">Total sites:</span>
             <span id="installsTotalValue" class="text-white font-semibold ml-1">—</span>

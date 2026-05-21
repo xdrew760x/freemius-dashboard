@@ -189,10 +189,12 @@ function onFilterChange() {
     }
 }
 
-function applyViewAndRender() {
+// Returns the items the user actually sees after the client-side filter
+// (installs IP filter) and current sort. Shared between the table render
+// and the CSV export so they always agree.
+function getVisibleItems() {
     let items = lastItems.slice();
 
-    // Client-side IP filter (installs only)
     if (currentTab === 'installs') {
         const ipFilter = document.getElementById('filterSelect').value;
         if (ipFilter) {
@@ -200,13 +202,17 @@ function applyViewAndRender() {
         }
     }
 
-    // Sort
     if (sortState) {
         const dir = sortState.dir === 'asc' ? 1 : -1;
         const col = sortState.col;
         items.sort((a, b) => compareValues(sortValue(a, col), sortValue(b, col)) * dir);
     }
 
+    return items;
+}
+
+function applyViewAndRender() {
+    const items = getVisibleItems();
     const body = document.getElementById('tableBody');
     if (!items.length) {
         body.innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
@@ -607,6 +613,55 @@ function esc(str) {
 function shortDate(d) {
     if (!d) return '-';
     return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function exportCsv() {
+    const items = getVisibleItems();
+    if (!items.length) {
+        setStatus('Nothing to export');
+        return;
+    }
+    const cols = sortKeys[currentTab];
+    const hdrs = headers[currentTab];
+    // Skip non-sortable columns (Actions) — they have null sort keys and
+    // contain UI buttons rather than data.
+    const exportable = cols.map((k, i) => ({ k, h: hdrs[i] })).filter(x => x.k);
+
+    const rows = [exportable.map(x => csvEscape(x.h)).join(',')];
+    items.forEach(it => {
+        rows.push(exportable.map(x => csvEscape(csvValue(it, x.k))).join(','));
+    });
+
+    const blob = new Blob([rows.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    const today = new Date().toISOString().slice(0, 10);
+    a.download = `freemius-${currentTab}-${currentProductId}-${today}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+    setStatus(`Exported ${items.length} ${currentTab}`);
+}
+
+// Resolves enriched columns (plan title, resolved IP) for export, otherwise
+// falls through to the raw item field.
+function csvValue(item, col) {
+    if (col === '__ip') return ipCache[hostOf(item.url)] || '';
+    if (col === 'plan_id') {
+        const plans = plansCache[currentProductId] || {};
+        const p = plans[String(item.plan_id)];
+        return p?.title || item.plan_id || '';
+    }
+    const v = item[col];
+    return v == null ? '' : v;
+}
+
+function csvEscape(v) {
+    const s = String(v);
+    if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
 }
 
 function loadPlansForCurrentProduct() {
