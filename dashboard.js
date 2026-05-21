@@ -267,6 +267,16 @@ function getVisibleItems() {
         }
     }
 
+    // Client-side keyword filter — composes with server-side ?search=.
+    // Freemius's server-side search only checks a subset of fields per tab, so
+    // we re-filter what came back against EVERY string-ish field of each item.
+    // That way "bigriglabs" matches install URLs even though Freemius's search
+    // only matches titles.
+    const kw = document.getElementById('searchInput').value.trim().toLowerCase();
+    if (kw) {
+        items = items.filter(it => itemMatchesKeyword(it, kw));
+    }
+
     if (sortState) {
         const dir = sortState.dir === 'asc' ? 1 : -1;
         const col = sortState.col;
@@ -276,15 +286,33 @@ function getVisibleItems() {
     return items;
 }
 
+function itemMatchesKeyword(item, kw) {
+    for (const k in item) {
+        if (k.startsWith('_product')) continue; // synthetic tags, not user data
+        const v = item[k];
+        if (v == null) continue;
+        if (typeof v === 'object') continue; // nested objects (rare); skip
+        if (String(v).toLowerCase().includes(kw)) return true;
+    }
+    return false;
+}
+
 function applyViewAndRender() {
     const items = getVisibleItems();
     const body = document.getElementById('tableBody');
     if (!items.length) {
         body.innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
-        return;
+    } else {
+        body.innerHTML = items.map(item => renderRowWithBulk(item)).join('');
+        updateBulkMasterState();
     }
-    body.innerHTML = items.map(item => renderRowWithBulk(item)).join('');
-    updateBulkMasterState();
+
+    // If a client-side filter narrowed the view, update the status line so the
+    // count matches what the user actually sees.
+    const kw = document.getElementById('searchInput').value.trim();
+    if (kw && items.length !== lastItems.length) {
+        setStatus(`${items.length} shown (of ${lastItems.length} fetched)`);
+    }
 }
 
 // Wraps renderRow to prepend per-row "leading" cells: bulk checkbox and/or

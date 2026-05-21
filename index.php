@@ -46,7 +46,7 @@
 
     <!-- Toolbar -->
     <div class="flex items-center gap-4 mb-6">
-        <input type="text" id="searchInput" placeholder="Search..." class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm w-64 focus:outline-none focus:border-blue-500" onkeydown="if(event.key==='Enter') loadCurrentTab()">
+        <input type="text" id="searchInput" placeholder="Search..." class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm w-64 focus:outline-none focus:border-blue-500" oninput="applyViewAndRender()" onkeydown="if(event.key==='Enter') loadCurrentTab()">
         <select id="filterSelect" class="bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500" onchange="onFilterChange()">
             <option value="">All</option>
         </select>

@@ -175,6 +175,12 @@ switch ($action) {
         break;
     }
 
+    // For these four tabs we deliberately DON'T forward ?search to Freemius —
+    // their server-side search only matches a narrow set of fields (e.g.
+    // install title but not URL) and silently drops items that the client-side
+    // keyword filter would otherwise catch. The frontend filters lastItems
+    // locally after the page is loaded, which gives correct results across
+    // every column.
     case 'list_subscriptions': {
         $q = ['count' => $count, 'offset' => $offset, 'extended' => 'true'];
         if ($filter) $q['filter'] = $filter;
