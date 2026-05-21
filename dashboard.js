@@ -46,6 +46,11 @@ const pricingCache = {};
 // on Save so we only PUT fields that actually changed.
 let editingLicense = null;
 
+// Bulk-select state. Keyed to a tab so switching tabs always starts fresh.
+const bulkSelectableTabs = new Set(['licenses', 'installs']);
+let bulkSelectionTab = null;          // which tab "owns" the current selection
+const bulkSelectedIds = new Set();    // string ids of rows currently checked
+
 function switchTab(tab) {
     currentTab = tab;
     currentOffset = 0;
@@ -120,6 +125,9 @@ function changePerPage() {
 }
 
 function loadCurrentTab() {
+    // Any change that fetches a new view invalidates the prior selection.
+    bulkClear();
+
     const search = document.getElementById('searchInput').value;
     const filter = document.getElementById('filterSelect').value;
     const perPage = perPageByTab[currentTab];
@@ -167,14 +175,20 @@ function renderTable(data) {
 function renderTableHeaders() {
     const head = document.getElementById('tableHead');
     const keys = sortKeys[currentTab];
-    head.innerHTML = '<tr>' + headers[currentTab].map((h, i) => {
+    const cols = headers[currentTab].map((h, i) => {
         const k = keys[i];
         if (!k) return `<th class="px-4 py-3 font-medium">${h}</th>`;
         const arrow = sortState && sortState.col === k
             ? (sortState.dir === 'asc' ? ' <span class="text-blue-400">↑</span>' : ' <span class="text-blue-400">↓</span>')
             : ' <span class="text-gray-700">↕</span>';
         return `<th class="px-4 py-3 font-medium cursor-pointer select-none hover:text-blue-400" onclick="onHeaderClick(${i})">${h}${arrow}</th>`;
-    }).join('') + '</tr>';
+    });
+    // Master checkbox column on bulk-capable tabs.
+    if (bulkSelectableTabs.has(currentTab)) {
+        cols.unshift(`<th class="px-4 py-3 w-8"><input type="checkbox" id="bulkMaster" onchange="toggleBulkAll(this.checked)"></th>`);
+    }
+    head.innerHTML = '<tr>' + cols.join('') + '</tr>';
+    updateBulkMasterState();
 }
 
 function onHeaderClick(colIdx) {
@@ -226,7 +240,18 @@ function applyViewAndRender() {
         body.innerHTML = '<tr><td colspan="99" class="px-4 py-8 text-center text-gray-500">No results</td></tr>';
         return;
     }
-    body.innerHTML = items.map(item => renderRow(item)).join('');
+    body.innerHTML = items.map(item => renderRowWithBulk(item)).join('');
+    updateBulkMasterState();
+}
+
+// Wraps renderRow to prepend a per-row checkbox cell on bulk-capable tabs.
+function renderRowWithBulk(item) {
+    const row = renderRow(item);
+    if (!bulkSelectableTabs.has(currentTab)) return row;
+    const sid = String(item.id);
+    const checked = bulkSelectedIds.has(sid) ? 'checked' : '';
+    const cell = `<td class="px-4 py-3 w-8"><input type="checkbox" data-bulk-id="${sid}" onchange="toggleBulkSelect('${sid}', this.checked)" ${checked}></td>`;
+    return row.replace(/<tr ([^>]*)>/, `<tr $1>${cell}`);
 }
 
 function hostOf(url) {
@@ -672,6 +697,99 @@ function csvEscape(v) {
     const s = String(v);
     if (/[",\r\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
     return s;
+}
+
+// ── Bulk select / delete ────────────────────────────────────────
+
+function toggleBulkSelect(id, checked) {
+    bulkSelectionTab = currentTab;
+    if (checked) bulkSelectedIds.add(id);
+    else bulkSelectedIds.delete(id);
+    updateBulkStrip();
+    updateBulkMasterState();
+}
+
+function toggleBulkAll(checked) {
+    bulkSelectionTab = currentTab;
+    lastItems.forEach(it => {
+        const sid = String(it.id);
+        if (checked) bulkSelectedIds.add(sid);
+        else bulkSelectedIds.delete(sid);
+    });
+    updateBulkStrip();
+    applyViewAndRender();
+}
+
+function bulkClear() {
+    bulkSelectedIds.clear();
+    bulkSelectionTab = null;
+    updateBulkStrip();
+}
+
+function bulkClearAndRerender() {
+    bulkClear();
+    applyViewAndRender();
+}
+
+function updateBulkStrip() {
+    const strip = document.getElementById('bulkStrip');
+    if (!bulkSelectableTabs.has(currentTab) || !bulkSelectedIds.size) {
+        strip.classList.add('hidden');
+        return;
+    }
+    strip.classList.remove('hidden');
+    document.getElementById('bulkStripCount').textContent = `${bulkSelectedIds.size} selected`;
+}
+
+function updateBulkMasterState() {
+    const master = document.getElementById('bulkMaster');
+    if (!master) return;
+    const total = lastItems.length;
+    const sel = lastItems.filter(it => bulkSelectedIds.has(String(it.id))).length;
+    master.checked = total > 0 && sel === total;
+    master.indeterminate = sel > 0 && sel < total;
+}
+
+function bulkDelete() {
+    const tab = currentTab;
+    const ids = [...bulkSelectedIds];
+    if (!ids.length) return;
+    const noun = tab === 'licenses' ? 'license' : 'install';
+    const plural = ids.length === 1 ? '' : 's';
+    showConfirm(`Delete ${ids.length} ${noun}${plural}? This cannot be undone.`, async () => {
+        const action = tab === 'licenses' ? 'delete_license' : 'delete_install';
+        const idParam = tab === 'licenses' ? 'license_id' : 'install_id';
+        const pid = currentProductId;
+        const failed = [];
+        let done = 0;
+        setStatus(`Deleting 0/${ids.length}...`);
+        await runWithConcurrency(ids, 4, async (id) => {
+            try {
+                const res = await fetch(`api.php?action=${action}&${idParam}=${id}&product_id=${pid}`).then(r => r.json());
+                if (!res.success) failed.push(id);
+            } catch { failed.push(id); }
+            done++;
+            setStatus(`Deleting ${done}/${ids.length}...`);
+        });
+        const ok = ids.length - failed.length;
+        setStatus(failed.length
+            ? `Deleted ${ok}/${ids.length}. Failed: ${failed.join(', ')}`
+            : `Deleted ${ok} ${noun}${ok === 1 ? '' : 's'}.`);
+        bulkClear();
+        loadCurrentTab();
+    });
+}
+
+// Simple worker pool — fans out up to `limit` async workers over `items`.
+async function runWithConcurrency(items, limit, worker) {
+    const queue = items.slice();
+    const runners = [];
+    for (let i = 0; i < Math.min(limit, queue.length); i++) {
+        runners.push((async () => {
+            while (queue.length) await worker(queue.shift());
+        })());
+    }
+    await Promise.all(runners);
 }
 
 // ── Edit License ────────────────────────────────────────────────

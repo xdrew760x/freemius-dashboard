@@ -63,6 +63,13 @@
         <div id="statusMsg" class="text-sm text-gray-400 ml-4"></div>
     </div>
 
+    <!-- Bulk-action strip — visible only when items are selected on a bulk-capable tab -->
+    <div id="bulkStrip" class="hidden flex items-center gap-3 mb-3 bg-gray-900 border border-gray-700 rounded-lg px-4 py-2 text-sm">
+        <span id="bulkStripCount" class="text-white font-medium"></span>
+        <button onclick="bulkDelete()" class="bg-red-700 hover:bg-red-600 text-white px-3 py-1 rounded text-xs transition">Delete Selected</button>
+        <button onclick="bulkClearAndRerender()" class="text-gray-400 hover:text-white text-xs ml-auto">Clear</button>
+    </div>
+
     <!-- Data Table -->
     <div class="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
         <div class="overflow-x-auto">
