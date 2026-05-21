@@ -1,4 +1,4 @@
-const perPageByTab = { users: 25, licenses: 25, subscriptions: 25, installs: 100 };
+const perPageByTab = { users: 25, licenses: 25, subscriptions: 25, installs: 100, payments: 25 };
 let currentTab = 'users';
 let currentOffset = 0;
 let lastResultCount = 0;
@@ -11,6 +11,7 @@ const filters = {
     licenses:      [{v:'',l:'All'},{v:'active',l:'Active'},{v:'cancelled',l:'Cancelled'},{v:'expired',l:'Expired'},{v:'abandoned',l:'Abandoned'}],
     subscriptions: [{v:'',l:'All'},{v:'active',l:'Active'},{v:'cancelled',l:'Cancelled'}],
     installs:      [{v:'',l:'All'}],
+    payments:      [{v:'',l:'All'},{v:'refunds',l:'Refunds Only'},{v:'not_refunded',l:'Not Refunded'}],
 };
 
 const headers = {
@@ -18,6 +19,7 @@ const headers = {
     licenses:      ['ID','Key','Plan ID','Quota','Activations','Expiration','Created','Actions'],
     subscriptions: ['ID','License ID','Plan ID','Gateway','Amount','Status','Next Payment','Actions'],
     installs:      ['ID','User ID','URL','IP','Version','License ID','Plan ID','Active','Actions'],
+    payments:      ['ID','User ID','License ID','Plan','Gross','Gateway','Type','Created','Actions'],
 };
 
 // Sort key per column (null = not sortable). '__ip' = resolved-IP pseudo-field.
@@ -26,6 +28,7 @@ const sortKeys = {
     licenses:      ['id','secret_key','plan_id','quota','activated','expiration','created',null],
     subscriptions: ['id','license_id','plan_id','gateway','total_gross','cancel_date','next_payment',null],
     installs:      ['id','user_id','url','__ip','version','license_id','plan_id','is_active',null],
+    payments:      ['id','user_id','license_id','plan_id','gross','gateway','is_renewal','created',null],
 };
 
 let lastItems = [];
@@ -66,6 +69,7 @@ function switchTab(tab) {
     search.value = '';
     if (tab === 'users') search.placeholder = 'Search by name, email, or ID...';
     else if (tab === 'licenses') search.placeholder = 'Search by ID or key...';
+    else if (tab === 'payments') search.placeholder = 'Search by user email...';
     else search.placeholder = 'Search...';
 
     // Sync per-page select with this tab's remembered preference
@@ -377,6 +381,25 @@ function renderRow(item) {
                     <button onclick="deleteInstall(${item.id})" class="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded transition">Delete</button>
                 </td>
             </tr>`;
+
+        case 'payments': {
+            const refunded = parseFloat(item.refunded_amount || 0) > 0;
+            const refundBadge = refunded
+                ? ` <span class="text-yellow-400 text-xs" title="Refunded $${parseFloat(item.refunded_amount).toFixed(2)}">refunded</span>`
+                : '';
+            const gross = parseFloat(item.gross || 0).toFixed(2);
+            return `<tr class="hover:bg-gray-800/50 transition">
+                <td class="px-4 py-3">${item.id}</td>
+                <td class="px-4 py-3">${item.user_id ? `<button onclick="viewUser(${item.user_id})" class="text-blue-400 hover:underline">${item.user_id}</button>` : '-'}</td>
+                <td class="px-4 py-3">${item.license_id || '-'}</td>
+                <td class="px-4 py-3">${planLabel(item.plan_id)}</td>
+                <td class="px-4 py-3">$${gross}${refundBadge}</td>
+                <td class="px-4 py-3">${esc(item.gateway || '-')}</td>
+                <td class="px-4 py-3">${item.is_renewal ? '<span class="text-blue-400">Renewal</span>' : '<span class="text-green-400">Initial</span>'}</td>
+                <td class="px-4 py-3 text-gray-500">${shortDate(item.created)}</td>
+                <td class="px-4 py-3">${item.user_id ? `<button onclick="viewUser(${item.user_id})" class="text-xs bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded">View User</button>` : ''}</td>
+            </tr>`;
+        }
     }
 }
 

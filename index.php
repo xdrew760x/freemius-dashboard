@@ -34,6 +34,7 @@
         <button onclick="switchTab('licenses')" id="tab-licenses" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Licenses</button>
         <button onclick="switchTab('subscriptions')" id="tab-subscriptions" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Subscriptions</button>
         <button onclick="switchTab('installs')" id="tab-installs" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Installs</button>
+        <button onclick="switchTab('payments')" id="tab-payments" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Payments</button>
     </div>
 </nav>
 

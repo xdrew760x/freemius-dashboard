@@ -157,6 +157,13 @@ switch ($action) {
         break;
     }
 
+    case 'list_payments': {
+        $q = ['count' => $count, 'offset' => $offset, 'extended' => 'true'];
+        if ($filter) $q['filter'] = $filter;
+        echo json_encode(fetchList($base, "/products/{$pid}/payments.json", $q, $bearer, 'payments'));
+        break;
+    }
+
     case 'test_create_license': {
         // Probe the Freemius license-create endpoint. Reports raw response so we
         // can see required fields / error messages without committing to the
