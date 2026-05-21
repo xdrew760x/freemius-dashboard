@@ -75,6 +75,34 @@ function apiRequest(string $url, string $bearer, string $method = 'GET', ?array 
     ];
 }
 
+// Builds a coupon PUT/POST body from query params. Only includes fields
+// the caller actually set, so update_coupon doesn't blow away unrelated
+// columns. The string 'null' is the explicit-null sentinel — needed for
+// nullable fields like redemptions_limit / end_date / start_date.
+function couponBodyFromRequest(array $req): array
+{
+    $body = [];
+    foreach (['code', 'title', 'discount_type'] as $k) {
+        if (isset($req[$k]) && $req[$k] !== '') $body[$k] = (string) $req[$k];
+    }
+    if (isset($req['discount']) && $req['discount'] !== '') {
+        $body['discount'] = is_numeric($req['discount']) ? $req['discount'] + 0 : $req['discount'];
+    }
+    foreach (['redemptions_limit', 'billing_cycles'] as $k) {
+        if (!isset($req[$k])) continue;
+        $body[$k] = $req[$k] === 'null' || $req[$k] === '' ? null : (int) $req[$k];
+    }
+    foreach (['start_date', 'end_date'] as $k) {
+        if (!isset($req[$k])) continue;
+        $body[$k] = $req[$k] === 'null' || $req[$k] === '' ? null : (string) $req[$k];
+    }
+    foreach (['has_renewals_discount', 'is_one_per_user'] as $k) {
+        if (!isset($req[$k])) continue;
+        $body[$k] = $req[$k] === '1' || $req[$k] === 'true';
+    }
+    return $body;
+}
+
 // Freemius API caps count per request at 50 — when the caller wants more,
 // chunk transparently so the frontend sees the full requested page.
 function fetchList(string $base, string $path, array $query, string $bearer, string $collectionKey): array
@@ -164,6 +192,38 @@ switch ($action) {
         $q = ['count' => $count, 'offset' => $offset, 'extended' => 'true'];
         if ($filter) $q['filter'] = $filter;
         echo json_encode(fetchList($base, "/products/{$pid}/payments.json", $q, $bearer, 'payments'));
+        break;
+    }
+
+    case 'list_coupons': {
+        $q = ['count' => $count, 'offset' => $offset];
+        if ($filter) $q['filter'] = $filter;
+        echo json_encode(fetchList($base, "/products/{$pid}/coupons.json", $q, $bearer, 'coupons'));
+        break;
+    }
+
+    case 'create_coupon': {
+        $body = couponBodyFromRequest($_GET);
+        if (!isset($body['code']) || !isset($body['discount']) || !isset($body['discount_type'])) {
+            echo json_encode(['success' => false, 'error' => 'code, discount, and discount_type are required']);
+            break;
+        }
+        echo json_encode(apiRequest("{$base}/products/{$pid}/coupons.json", $bearer, 'POST', $body));
+        break;
+    }
+
+    case 'update_coupon': {
+        $cid = (int) ($_GET['coupon_id'] ?? 0);
+        if (!$cid) { echo json_encode(['success' => false, 'error' => 'Missing coupon_id']); break; }
+        $body = couponBodyFromRequest($_GET);
+        echo json_encode(apiRequest("{$base}/products/{$pid}/coupons/{$cid}.json", $bearer, 'PUT', $body));
+        break;
+    }
+
+    case 'delete_coupon': {
+        $cid = (int) ($_GET['coupon_id'] ?? 0);
+        if (!$cid) { echo json_encode(['success' => false, 'error' => 'Missing coupon_id']); break; }
+        echo json_encode(apiRequest("{$base}/products/{$pid}/coupons/{$cid}.json", $bearer, 'DELETE'));
         break;
     }
 

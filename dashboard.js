@@ -1,4 +1,4 @@
-const perPageByTab = { users: 25, licenses: 25, subscriptions: 25, installs: 100, payments: 25 };
+const perPageByTab = { users: 25, licenses: 25, subscriptions: 25, installs: 100, payments: 25, coupons: 25 };
 let currentTab = 'users';
 let currentOffset = 0;
 let lastResultCount = 0;
@@ -12,6 +12,7 @@ const filters = {
     subscriptions: [{v:'',l:'All'},{v:'active',l:'Active'},{v:'cancelled',l:'Cancelled'}],
     installs:      [{v:'',l:'All'}],
     payments:      [{v:'',l:'All'},{v:'refunds',l:'Refunds Only'},{v:'not_refunded',l:'Not Refunded'}],
+    coupons:       [{v:'',l:'All'}],
 };
 
 const headers = {
@@ -20,6 +21,7 @@ const headers = {
     subscriptions: ['ID','License ID','Plan ID','Gateway','Amount','Status','Next Payment','Actions'],
     installs:      ['ID','User ID','URL','IP','Version','License ID','Plan ID','Active','Actions'],
     payments:      ['ID','User ID','License ID','Plan','Gross','Gateway','Type','Created','Actions'],
+    coupons:       ['ID','Code','Title','Discount','Redemptions','Start','End','Status','Actions'],
 };
 
 // Sort key per column (null = not sortable). '__ip' = resolved-IP pseudo-field.
@@ -29,6 +31,7 @@ const sortKeys = {
     subscriptions: ['id','license_id','plan_id','gateway','total_gross','cancel_date','next_payment',null],
     installs:      ['id','user_id','url','__ip','version','license_id','plan_id','is_active',null],
     payments:      ['id','user_id','license_id','plan_id','gross','gateway','is_renewal','created',null],
+    coupons:       ['id','code','title','discount','redemptions','start_date','end_date',null,null],
 };
 
 let lastItems = [];
@@ -47,7 +50,7 @@ const pricingCache = {};
 let editingLicense = null;
 
 // Bulk-select state. Keyed to a tab so switching tabs always starts fresh.
-const bulkSelectableTabs = new Set(['licenses', 'installs']);
+const bulkSelectableTabs = new Set(['licenses', 'installs', 'coupons']);
 let bulkSelectionTab = null;          // which tab "owns" the current selection
 const bulkSelectedIds = new Set();    // string ids of rows currently checked
 
@@ -87,6 +90,9 @@ function switchTab(tab) {
 
     // Sync per-page select with this tab's remembered preference
     document.getElementById('perPageSelect').value = perPageByTab[tab];
+
+    // Tab-specific action buttons
+    document.getElementById('newCouponBtn').classList.toggle('hidden', tab !== 'coupons');
 
     // Show the total-sites badge only on the installs tab
     const badge = document.getElementById('installsTotalBadge');
@@ -423,6 +429,29 @@ function renderRow(item) {
                 </td>
             </tr>`;
 
+        case 'coupons': {
+            const disc = item.discount_type === 'dollar'
+                ? `$${parseFloat(item.discount || 0).toFixed(2)}`
+                : `${parseFloat(item.discount || 0)}%`;
+            const used = item.redemptions ?? 0;
+            const cap  = item.redemptions_limit ?? '∞';
+            const active = isCouponActive(item);
+            return `<tr class="hover:bg-gray-800/50 transition">
+                <td class="px-4 py-3">${item.id}</td>
+                <td class="px-4 py-3 font-mono">${esc(item.code || '-')}</td>
+                <td class="px-4 py-3">${esc(item.title || '-')}</td>
+                <td class="px-4 py-3">${disc}</td>
+                <td class="px-4 py-3">${used} / ${cap}</td>
+                <td class="px-4 py-3 text-gray-500">${item.start_date ? shortDate(item.start_date) : '-'}</td>
+                <td class="px-4 py-3 text-gray-500">${item.end_date ? shortDate(item.end_date) : '-'}</td>
+                <td class="px-4 py-3">${active ? '<span class="text-green-400">Active</span>' : '<span class="text-red-400">Inactive</span>'}</td>
+                <td class="px-4 py-3 flex gap-2">
+                    <button onclick="openEditCoupon(${item.id})" class="text-xs bg-blue-700 hover:bg-blue-600 px-3 py-1 rounded transition">Edit</button>
+                    <button onclick="deleteCoupon(${item.id}, '${esc(item.code || '').replace(/'/g, "\\'")}')" class="text-xs bg-red-700 hover:bg-red-600 px-3 py-1 rounded transition">Delete</button>
+                </td>
+            </tr>`;
+        }
+
         case 'payments': {
             const refunded = parseFloat(item.refunded_amount || 0) > 0;
             const refundBadge = refunded
@@ -699,6 +728,126 @@ function csvEscape(v) {
     return s;
 }
 
+// ── Coupons ─────────────────────────────────────────────────────
+
+let editingCoupon = null; // null = creating; otherwise the original coupon being edited
+
+function isCouponActive(c) {
+    if (c.is_active === false) return false; // explicit deactivation
+    const now = Date.now();
+    if (c.redemptions_limit != null && (c.redemptions ?? 0) >= c.redemptions_limit) return false;
+    if (c.start_date && new Date(c.start_date).getTime() > now) return false;
+    if (c.end_date && new Date(c.end_date).getTime() < now) return false;
+    return true;
+}
+
+function openNewCoupon() {
+    editingCoupon = null;
+    document.getElementById('editCouponTitle').textContent = 'New Coupon';
+    document.getElementById('editCouponInfo').textContent = ' ';
+    document.getElementById('editCouponCode').value = '';
+    document.getElementById('editCouponTitleField').value = '';
+    document.getElementById('editCouponDiscount').value = '';
+    document.getElementById('editCouponDiscountType').value = 'percentage';
+    document.getElementById('editCouponLimit').value = '';
+    document.getElementById('editCouponStart').value = '';
+    document.getElementById('editCouponEnd').value = '';
+    document.getElementById('editCouponRenewals').checked = false;
+    document.getElementById('editCouponOnePer').checked = false;
+    document.getElementById('editCouponCode').disabled = false;
+    document.getElementById('editCouponModal').classList.remove('hidden');
+    document.getElementById('editCouponCode').focus();
+}
+
+function openEditCoupon(couponId) {
+    const c = lastItems.find(it => String(it.id) === String(couponId));
+    if (!c) { setStatus(`Coupon #${couponId} not in current view`); return; }
+    editingCoupon = c;
+    document.getElementById('editCouponTitle').textContent = 'Edit Coupon';
+    document.getElementById('editCouponInfo').textContent = `#${c.id} · created ${shortDate(c.created)}${c.redemptions ? ` · ${c.redemptions} redemptions` : ''}`;
+    document.getElementById('editCouponCode').value = c.code || '';
+    document.getElementById('editCouponCode').disabled = true; // changing code mid-life confuses customers
+    document.getElementById('editCouponTitleField').value = c.title || '';
+    document.getElementById('editCouponDiscount').value = c.discount ?? '';
+    document.getElementById('editCouponDiscountType').value = c.discount_type || 'percentage';
+    document.getElementById('editCouponLimit').value = c.redemptions_limit ?? '';
+    document.getElementById('editCouponStart').value = c.start_date ? String(c.start_date).slice(0, 10) : '';
+    document.getElementById('editCouponEnd').value = c.end_date ? String(c.end_date).slice(0, 10) : '';
+    document.getElementById('editCouponRenewals').checked = !!c.has_renewals_discount;
+    document.getElementById('editCouponOnePer').checked = !!c.is_one_per_user;
+    document.getElementById('editCouponModal').classList.remove('hidden');
+}
+
+function closeEditCoupon() {
+    document.getElementById('editCouponModal').classList.add('hidden');
+    editingCoupon = null;
+}
+
+function saveCoupon() {
+    const code = document.getElementById('editCouponCode').value.trim();
+    const title = document.getElementById('editCouponTitleField').value.trim();
+    const discount = document.getElementById('editCouponDiscount').value;
+    const discType = document.getElementById('editCouponDiscountType').value;
+    const limit = document.getElementById('editCouponLimit').value;
+    const start = document.getElementById('editCouponStart').value;
+    const end = document.getElementById('editCouponEnd').value;
+    const renewals = document.getElementById('editCouponRenewals').checked;
+    const onePer = document.getElementById('editCouponOnePer').checked;
+
+    if (!code) { setStatus('Coupon code is required'); return; }
+    if (!discount) { setStatus('Discount is required'); return; }
+
+    const params = [];
+    const add = (k, v) => params.push(`${k}=${encodeURIComponent(v)}`);
+
+    if (!editingCoupon) {
+        // Create — send everything the user provided
+        params.push('action=create_coupon');
+        add('code', code);
+        if (title) add('title', title);
+        add('discount', discount);
+        add('discount_type', discType);
+        if (limit) add('redemptions_limit', limit);
+        if (start) add('start_date', start + ' 00:00:00');
+        if (end)   add('end_date',   end   + ' 23:59:59');
+        if (renewals) add('has_renewals_discount', '1');
+        if (onePer)   add('is_one_per_user', '1');
+    } else {
+        // Update — diff against the loaded coupon, only send changed fields
+        params.push('action=update_coupon');
+        add('coupon_id', editingCoupon.id);
+        const orig = editingCoupon;
+        if (title !== (orig.title || '')) add('title', title);
+        if (String(discount) !== String(orig.discount)) add('discount', discount);
+        if (discType !== orig.discount_type) add('discount_type', discType);
+        const newLimit = limit === '' ? null : parseInt(limit, 10);
+        if (newLimit !== (orig.redemptions_limit ?? null)) add('redemptions_limit', limit === '' ? 'null' : limit);
+        const origStart = orig.start_date ? String(orig.start_date).slice(0, 10) : '';
+        const origEnd   = orig.end_date   ? String(orig.end_date).slice(0, 10)   : '';
+        if (start !== origStart) add('start_date', start ? start + ' 00:00:00' : 'null');
+        if (end !== origEnd)     add('end_date',   end   ? end   + ' 23:59:59' : 'null');
+        if (renewals !== !!orig.has_renewals_discount) add('has_renewals_discount', renewals ? '1' : '0');
+        if (onePer !== !!orig.is_one_per_user)         add('is_one_per_user',       onePer   ? '1' : '0');
+
+        if (params.length === 2) {
+            closeEditCoupon();
+            setStatus('No changes to save.');
+            return;
+        }
+    }
+
+    const label = editingCoupon ? `Coupon #${editingCoupon.id}` : `Coupon "${code}"`;
+    closeEditCoupon();
+    apiAction(params.join('&'), label);
+}
+
+function deleteCoupon(id, code) {
+    const label = code ? `coupon "${code}"` : `coupon #${id}`;
+    showConfirm(`Delete ${label}? This cannot be undone.`, () => {
+        apiAction(`action=delete_coupon&coupon_id=${id}`, `Coupon #${id}`);
+    });
+}
+
 // ── Bulk select / delete ────────────────────────────────────────
 
 function toggleBulkSelect(id, checked) {
@@ -750,15 +899,21 @@ function updateBulkMasterState() {
     master.indeterminate = sel > 0 && sel < total;
 }
 
+const BULK_DELETE_BY_TAB = {
+    licenses: { action: 'delete_license', idParam: 'license_id', noun: 'license' },
+    installs: { action: 'delete_install', idParam: 'install_id', noun: 'install'  },
+    coupons:  { action: 'delete_coupon',  idParam: 'coupon_id',  noun: 'coupon'   },
+};
+
 function bulkDelete() {
     const tab = currentTab;
     const ids = [...bulkSelectedIds];
     if (!ids.length) return;
-    const noun = tab === 'licenses' ? 'license' : 'install';
+    const cfg = BULK_DELETE_BY_TAB[tab];
+    if (!cfg) return;
+    const { action, idParam, noun } = cfg;
     const plural = ids.length === 1 ? '' : 's';
     showConfirm(`Delete ${ids.length} ${noun}${plural}? This cannot be undone.`, async () => {
-        const action = tab === 'licenses' ? 'delete_license' : 'delete_install';
-        const idParam = tab === 'licenses' ? 'license_id' : 'install_id';
         const pid = currentProductId;
         const failed = [];
         let done = 0;

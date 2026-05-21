@@ -35,6 +35,7 @@
         <button onclick="switchTab('subscriptions')" id="tab-subscriptions" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Subscriptions</button>
         <button onclick="switchTab('installs')" id="tab-installs" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Installs</button>
         <button onclick="switchTab('payments')" id="tab-payments" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Payments</button>
+        <button onclick="switchTab('coupons')" id="tab-coupons" class="tab-btn px-6 py-3 text-sm hover:text-blue-400 transition">Coupons</button>
     </div>
 </nav>
 
@@ -55,6 +56,7 @@
         </select>
         <button onclick="loadCurrentTab()" class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm transition">Load</button>
         <button onclick="exportCsv()" class="bg-gray-800 hover:bg-gray-700 border border-gray-700 text-gray-200 px-4 py-2 rounded-lg text-sm transition" title="Export current view to CSV">Export CSV</button>
+        <button id="newCouponBtn" onclick="openNewCoupon()" class="hidden bg-green-700 hover:bg-green-600 text-white px-4 py-2 rounded-lg text-sm transition">+ New Coupon</button>
         <div id="installsTotalBadge" class="hidden ml-auto text-sm bg-gray-800 border border-gray-700 rounded-lg px-3 py-2">
             <span class="text-gray-500">Total sites:</span>
             <span id="installsTotalValue" class="text-white font-semibold ml-1">—</span>
@@ -134,6 +136,63 @@
         <div class="flex justify-end gap-3 mt-6">
             <button onclick="closeEditLicense()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">Cancel</button>
             <button id="editLicenseSaveBtn" onclick="saveEditLicense()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm text-white transition">Save Changes</button>
+        </div>
+    </div>
+</div>
+
+<!-- Coupon Edit Modal -->
+<div id="editCouponModal" class="fixed inset-0 bg-black/60 flex items-center justify-center z-50 hidden">
+    <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 max-w-lg w-full mx-4">
+        <h3 id="editCouponTitle" class="text-lg font-semibold text-white mb-1">New Coupon</h3>
+        <p id="editCouponInfo" class="text-xs text-gray-500 mb-5">&nbsp;</p>
+
+        <div class="space-y-4 text-sm">
+            <div class="flex gap-4">
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Code</label>
+                    <input type="text" id="editCouponCode" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 font-mono focus:outline-none focus:border-blue-500" placeholder="e.g. BLACKFRIDAY">
+                </div>
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Title</label>
+                    <input type="text" id="editCouponTitleField" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500" placeholder="Display name (optional)">
+                </div>
+            </div>
+            <div class="flex gap-4">
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Discount</label>
+                    <input type="number" id="editCouponDiscount" min="0" step="0.01" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                </div>
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Type</label>
+                    <select id="editCouponDiscountType" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                        <option value="percentage">Percentage (%)</option>
+                        <option value="dollar">Dollar ($)</option>
+                    </select>
+                </div>
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Limit</label>
+                    <input type="number" id="editCouponLimit" min="1" placeholder="∞" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                </div>
+            </div>
+            <div class="flex gap-4">
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">Start Date</label>
+                    <input type="date" id="editCouponStart" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                </div>
+                <div class="flex-1">
+                    <label class="block text-gray-400 mb-1">End Date</label>
+                    <input type="date" id="editCouponEnd" class="w-full bg-gray-800 border border-gray-700 rounded-lg px-3 py-2 focus:outline-none focus:border-blue-500">
+                </div>
+            </div>
+            <div class="flex gap-6">
+                <label class="flex items-center gap-2"><input type="checkbox" id="editCouponRenewals"> <span>Apply on renewals</span></label>
+                <label class="flex items-center gap-2"><input type="checkbox" id="editCouponOnePer"> <span>One per user</span></label>
+            </div>
+        </div>
+
+        <div class="flex justify-end gap-3 mt-6">
+            <button onclick="closeEditCoupon()" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">Cancel</button>
+            <button id="editCouponSaveBtn" onclick="saveCoupon()" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm text-white transition">Save</button>
         </div>
     </div>
 </div>
