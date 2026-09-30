@@ -64,6 +64,18 @@ function switchTab(tab) {
     document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('tab-active'));
     document.getElementById('tab-' + tab).classList.add('tab-active');
 
+    // Coverage and No License have their own panels and skip the shared table path.
+    const isCoverage = tab === 'coverage';
+    const isUnlicensed = tab === 'unlicensed';
+    const isAllInstalls = tab === 'allinstalls';
+    document.getElementById('coveragePanel').classList.toggle('hidden', !isCoverage);
+    document.getElementById('unlicensedPanel').classList.toggle('hidden', !isUnlicensed);
+    document.getElementById('allInstallsPanel').classList.toggle('hidden', !isAllInstalls);
+    document.getElementById('standardView').classList.toggle('hidden', isCoverage || isUnlicensed || isAllInstalls);
+    if (isCoverage) { initCoverage(); return; }
+    if (isUnlicensed) { loadUnlicensed(); return; }
+    if (isAllInstalls) { loadAllInstalls(false); return; }
+
     // Update filters. Installs has no useful server-side filter, so we hijack
     // this dropdown for client-side IP filtering — options are populated once
     // the install URLs resolve.
@@ -1256,7 +1268,505 @@ function changeProduct() {
     // Plans are per-product; fetch in parallel and re-render once they land
     // so the plan_id columns get enriched with titles.
     ensurePlansLoaded().then(() => { if (lastItems.length) applyViewAndRender(); });
+    if (currentTab === 'coverage') { renderCoverage(); return; }
+    if (currentTab === 'unlicensed') { renderUnlicensed(); return; }
+    if (currentTab === 'allinstalls') { renderAllInstalls(); return; }
     loadCurrentTab();
+}
+
+// ── Coverage ────────────────────────────────────────────────────
+// Freemius only records a site once its admin opts in or activates a key,
+// so sites that skipped it are invisible there. This tab diffs a known-domain
+// list against every configured product's installs, and optionally scans
+// each homepage to confirm the site actually runs xpress-2.
+
+const COVERAGE_STORAGE_KEY = 'freemius.coverageDomains';
+let coverageRows = []; // [{host, fs, scan, status}]
+let coverageCapNote = '';
+
+const coverageStatusMeta = {
+    licensed: { label: 'Licensed',                  cls: 'bg-green-900/60 text-green-300' },
+    nokey:    { label: 'In Freemius, no license',   cls: 'bg-yellow-900/60 text-yellow-300' },
+    missing:  { label: 'Missing from Freemius',     cls: 'bg-red-900/60 text-red-300' },
+    other:    { label: 'Not xpress-2 / unreachable', cls: 'bg-gray-800 text-gray-400' },
+    pending:  { label: 'Scanning…',                 cls: 'bg-gray-800 text-gray-500' },
+};
+
+function initCoverage() {
+    const ta = document.getElementById('coverageDomains');
+    if (!ta.value) {
+        try { ta.value = localStorage.getItem(COVERAGE_STORAGE_KEY) || ''; } catch (e) {}
+    }
+    renderCoverage();
+}
+
+// Mirrors normalizeHost() in api.php so rows and install records key the same way.
+function normalizeCoverageHost(raw) {
+    let s = String(raw || '').trim().toLowerCase();
+    if (!s || s.startsWith('#')) return '';
+    if (!/^https?:\/\//.test(s)) s = 'http://' + s;
+    try {
+        const h = new URL(s).hostname.replace(/^www\./, '');
+        return /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(h) ? h : '';
+    } catch (e) { return ''; }
+}
+
+function coverageStatus(row) {
+    if (row.fs) return row.fs.license_id ? 'licensed' : 'nokey';
+    if (!row.scan) return row.scanned === false ? 'missing' : 'pending';
+    return row.scan.xpress2 ? 'missing' : 'other';
+}
+
+async function runCoverage() {
+    const raw = document.getElementById('coverageDomains').value;
+    try { localStorage.setItem(COVERAGE_STORAGE_KEY, raw); } catch (e) {}
+
+    const hosts = [...new Set(raw.split(/[\s,]+/).map(normalizeCoverageHost).filter(Boolean))];
+    const statusEl = document.getElementById('coverageStatus');
+    if (!hosts.length) { statusEl.textContent = 'No valid domains.'; return; }
+
+    const btn = document.getElementById('coverageRunBtn');
+    btn.disabled = true;
+    const doScan = document.getElementById('coverageScanSites').checked;
+
+    try {
+        statusEl.textContent = 'Pulling installs from every product…';
+        const res = await fetch('api.php?action=coverage_installs').then(r => r.json());
+        if (!res.success) throw new Error(res.error || `Freemius HTTP ${res.http_code}`);
+        const installs = res.data || {};
+        const capped = Object.entries(res.capped || {});
+        coverageCapNote = capped.length
+            ? 'Freemius plan cap: only the first ' + capped.map(([pid, c]) => `${c.seen} installs of ${productLookup[pid] || pid}`).join(', ')
+              + ' are visible via the API, so some "Missing" sites may actually be registered.'
+            : '';
+
+        coverageRows = hosts.map(host => ({ host, fs: installs[host] || null, scan: null, scanned: doScan ? undefined : false }));
+        renderCoverage();
+
+        if (doScan) {
+            // Batches of 10 hosts per request, 3 requests in flight.
+            const batches = [];
+            for (let i = 0; i < hosts.length; i += 10) batches.push(hosts.slice(i, i + 10));
+            let done = 0;
+            statusEl.textContent = `Scanning 0 / ${hosts.length} sites…`;
+            await runWithConcurrency(batches, 3, async batch => {
+                const body = new URLSearchParams();
+                batch.forEach(h => body.append('hosts[]', h));
+                let data = {};
+                try {
+                    const r = await fetch('api.php?action=coverage_scan', { method: 'POST', body }).then(r => r.json());
+                    data = r.data || {};
+                } catch (e) {}
+                batch.forEach(h => {
+                    const row = coverageRows.find(x => x.host === h);
+                    row.scan = data[h] || { error: 'scan failed', themes: [], xpress2: false };
+                    // A site that redirects to a different domain may be recorded
+                    // in Freemius under the final host.
+                    const alt = row.scan.final_host;
+                    if (!row.fs && alt && installs[alt]) row.fs = installs[alt];
+                });
+                done += batch.length;
+                statusEl.textContent = `Scanning ${done} / ${hosts.length} sites…`;
+                renderCoverage();
+            });
+        }
+
+        const missing = coverageRows.filter(r => coverageStatus(r) === 'missing').length;
+        statusEl.textContent = `Done — ${hosts.length} domains checked, ${missing} missing from Freemius.`
+            + await syncUnlicensedFromCoverage()
+            + (coverageCapNote ? ' ⚠ ' + coverageCapNote : '');
+    } catch (err) {
+        statusEl.textContent = 'Failed: ' + err.message;
+    } finally {
+        btn.disabled = false;
+        renderCoverage();
+    }
+}
+
+function renderCoverage() {
+    const body = document.getElementById('coverageBody');
+    const summary = document.getElementById('coverageSummary');
+    if (!body) return;
+
+    const counts = { licensed: 0, nokey: 0, missing: 0, other: 0 };
+    coverageRows.forEach(r => { const s = coverageStatus(r); if (s in counts) counts[s]++; });
+    summary.innerHTML = coverageRows.length
+        ? ['missing', 'nokey', 'licensed', 'other'].map(k => `
+            <button onclick="document.getElementById('coverageFilter').value='${k}';renderCoverage()" class="text-left bg-gray-900 border border-gray-800 hover:border-gray-600 rounded-lg px-4 py-3">
+                <div class="text-2xl font-semibold text-white">${counts[k]}</div>
+                <div class="text-xs text-gray-400">${coverageStatusMeta[k].label}</div>
+            </button>`).join('')
+        : '';
+
+    if (!coverageRows.length) {
+        body.innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-500">Paste domains and click "Run Check"</td></tr>';
+        return;
+    }
+
+    const filter = document.getElementById('coverageFilter').value;
+    const order = { missing: 0, nokey: 1, pending: 2, other: 3, licensed: 4 };
+    const rows = coverageRows
+        .filter(r => !filter || coverageStatus(r) === filter)
+        .sort((a, b) => order[coverageStatus(a)] - order[coverageStatus(b)] || a.host.localeCompare(b.host));
+
+    body.innerHTML = rows.map(r => {
+        const st = coverageStatusMeta[coverageStatus(r)];
+        const fs = r.fs
+            ? `#${esc(String(r.fs.install_id))} · ${esc(productLookup[String(r.fs.product_id)] || r.fs.product_id)}${r.fs.license_id ? ` · lic ${esc(String(r.fs.license_id))}` : ''}${r.fs.is_active ? '' : ' · <span class="text-yellow-400">inactive</span>'}`
+            : '<span class="text-gray-600">—</span>';
+        let scan = '<span class="text-gray-600">—</span>';
+        if (r.scan) {
+            if (r.scan.error && !r.scan.http_code) scan = `<span class="text-red-400">${esc(r.scan.error)}</span>`;
+            else {
+                const themes = r.scan.themes?.length ? r.scan.themes.join(', ') : (r.scan.is_wp ? 'WP, theme not detected' : 'not WordPress?');
+                scan = `HTTP ${r.scan.http_code} · ${esc(themes)}${r.scan.final_host ? ` · → ${esc(r.scan.final_host)}` : ''}`;
+            }
+        }
+        const ver = r.scan?.x2_version || r.fs?.version || '';
+        return `<tr class="hover:bg-gray-800/50">
+            <td class="px-4 py-2"><a href="https://${esc(r.host)}/" target="_blank" rel="noopener" class="text-blue-400 hover:underline">${esc(r.host)}</a></td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded text-xs whitespace-nowrap ${st.cls}">${st.label}</span></td>
+            <td class="px-4 py-2 text-xs text-gray-300">${fs}</td>
+            <td class="px-4 py-2 text-xs text-gray-400">${scan}</td>
+            <td class="px-4 py-2 text-xs text-gray-300">${esc(ver)}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-500">No rows match this filter</td></tr>';
+}
+
+function exportCoverageCsv() {
+    if (!coverageRows.length) { document.getElementById('coverageStatus').textContent = 'Nothing to export'; return; }
+    const lines = [['Domain', 'Status', 'Install ID', 'Product', 'License ID', 'HTTP', 'Themes', 'Redirects To', 'xpress-2 Version'].join(',')];
+    coverageRows.forEach(r => {
+        lines.push([
+            r.host,
+            coverageStatusMeta[coverageStatus(r)].label,
+            r.fs?.install_id ?? '',
+            r.fs ? (productLookup[String(r.fs.product_id)] || r.fs.product_id) : '',
+            r.fs?.license_id ?? '',
+            r.scan?.http_code ?? '',
+            (r.scan?.themes || []).join(' '),
+            r.scan?.final_host ?? '',
+            r.scan?.x2_version || r.fs?.version || '',
+        ].map(csvEscape).join(','));
+    });
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `freemius-coverage-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// ── All Installs ────────────────────────────────────────────────
+// Every install of every configured product, grouped into one row per
+// domain. Ignores the header Product dropdown — the product filter here
+// narrows the combined view instead.
+
+let allInstalls = null;       // flat install records from api.php, null = not loaded
+let allInstallsCapped = {};
+
+async function loadAllInstalls(force) {
+    const statusEl = document.getElementById('allInstallsStatus');
+    const sel = document.getElementById('allInstallsProduct');
+    if (sel.options.length === 1) {
+        configuredProducts.forEach(p => sel.insertAdjacentHTML('beforeend', `<option value="${p.id}">${esc(p.label)}</option>`));
+    }
+    if (allInstalls && !force) { renderAllInstalls(); return; }
+    statusEl.textContent = 'Pulling installs from every product…';
+    document.getElementById('allInstallsBody').innerHTML = '<tr><td colspan="5" class="px-4 py-8 text-center"><div class="spinner mx-auto"></div></td></tr>';
+    try {
+        const [res] = await Promise.all([
+            fetch('api.php?action=all_installs').then(r => r.json()),
+            loadAllPlans(),
+        ]);
+        if (!res.success) throw new Error(res.error || 'load failed');
+        allInstalls = res.data || [];
+        allInstallsCapped = res.capped || {};
+        const errs = Object.entries(res.errors || {});
+        statusEl.textContent = errs.length
+            ? '⚠ ' + errs.map(([pid, m]) => `${productLookup[pid] || pid}: ${m}`).join('; ')
+            : '';
+    } catch (e) {
+        allInstalls = null;
+        statusEl.textContent = 'Failed: ' + e.message;
+        document.getElementById('allInstallsBody').innerHTML = '';
+        return;
+    }
+    renderAllInstalls();
+}
+
+// Plans for every product, so badges show plan titles instead of ids.
+function loadAllPlans() {
+    return Promise.all(configuredProducts.map(p => {
+        if (plansCache[p.id]) return Promise.resolve();
+        return fetch(`api.php?action=list_plans&product_id=${p.id}`)
+            .then(r => r.json())
+            .then(res => { plansCache[p.id] = Object.fromEntries((res?.data?.plans || []).map(pl => [String(pl.id), pl])); })
+            .catch(() => {});
+    }));
+}
+
+// host → { host, installs: [...] }, after the product / active filters.
+function groupAllInstalls() {
+    const product = document.getElementById('allInstallsProduct').value;
+    const activeOnly = document.getElementById('allInstallsActive').checked;
+    const groups = {};
+    (allInstalls || []).forEach(i => {
+        if (product && String(i.product_id) !== product) return;
+        if (activeOnly && !i.is_active) return;
+        const key = i.host || i.url || `#${i.install_id}`;
+        (groups[key] = groups[key] || { host: key, installs: [] }).installs.push(i);
+    });
+    return Object.values(groups).map(g => ({ ...g, licensed: g.installs.every(i => i.license_id) }));
+}
+
+function filteredAllInstalls() {
+    const lic = document.getElementById('allInstallsLicense').value;
+    const q = document.getElementById('allInstallsSearch').value.trim().toLowerCase();
+    return groupAllInstalls()
+        .filter(g => (!lic || (lic === 'licensed') === g.licensed) && (!q || g.host.includes(q)))
+        .sort((a, b) => a.host.localeCompare(b.host));
+}
+
+function renderAllInstalls() {
+    if (!allInstalls) return;
+
+    const cap = Object.entries(allInstallsCapped);
+    const capEl = document.getElementById('allInstallsCap');
+    capEl.classList.toggle('hidden', !cap.length);
+    capEl.innerHTML = cap.map(([pid, c]) =>
+        `⚠ <strong>${esc(productLookup[pid] || pid)}</strong>: Freemius only shows ${c.seen}${c.total ? ` of ${c.total}` : ''} installs on your current plan — the rest are hidden in the Freemius dashboard too.`
+    ).join('<br>');
+
+    const groups = groupAllInstalls();
+    const nokey = groups.filter(g => !g.licensed).length;
+    const installCount = groups.reduce((n, g) => n + g.installs.length, 0);
+    const card = (lic, label, n, cls) => `
+        <button onclick="document.getElementById('allInstallsLicense').value='${lic}';renderAllInstalls()" class="text-left bg-gray-900 border border-gray-800 hover:border-gray-600 rounded-lg px-4 py-3">
+            <div class="text-2xl font-semibold ${cls}">${n}</div>
+            <div class="text-xs text-gray-400">${label}</div>
+        </button>`;
+    document.getElementById('allInstallsSummary').innerHTML =
+        card('', 'Sites', groups.length, 'text-gray-100')
+        + card('', 'Installs (all products)', installCount, 'text-gray-300')
+        + card('licensed', 'Licensed', groups.length - nokey, 'text-green-300')
+        + card('nokey', 'No license', nokey, 'text-yellow-300');
+
+    const rows = filteredAllInstalls();
+    document.getElementById('allInstallsBody').innerHTML = rows.map(g => {
+        const badges = g.installs.map(i => {
+            const name = esc(productLookup[String(i.product_id)] || String(i.product_id));
+            const plan = plansCache[i.product_id]?.[String(i.plan_id)]?.title;
+            const detail = i.license_id ? `lic ${esc(String(i.license_id))}${plan ? ' · ' + esc(plan) : ''}` : 'no license';
+            const cls = i.license_id ? 'bg-green-900/60 text-green-300' : 'bg-yellow-900/60 text-yellow-300';
+            return `<span class="inline-block px-2 py-0.5 rounded text-xs whitespace-nowrap mr-1 mb-1 ${cls}" title="Install #${esc(String(i.install_id))}${i.is_active ? '' : ' (inactive)'}">${name} · ${detail}${i.is_active ? '' : ' · inactive'}</span>`;
+        }).join('');
+        const st = g.licensed ? coverageStatusMeta.licensed : { label: 'No license', cls: coverageStatusMeta.nokey.cls };
+        const versions = [...new Set(g.installs.map(i => i.version).filter(Boolean))].join(', ');
+        const latest = g.installs.map(i => i.created).filter(Boolean).sort().pop();
+        const link = g.host.includes('.') ? `<a href="https://${esc(g.host)}/" target="_blank" rel="noopener" class="text-blue-400 hover:underline">${esc(g.host)}</a>` : esc(g.host);
+        return `<tr class="hover:bg-gray-800/50">
+            <td class="px-4 py-2">${link}</td>
+            <td class="px-4 py-2">${badges}</td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded text-xs whitespace-nowrap ${st.cls}">${st.label}</span></td>
+            <td class="px-4 py-2 text-xs text-gray-300">${esc(versions)}</td>
+            <td class="px-4 py-2 text-xs text-gray-400">${shortDate(latest)}</td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="5" class="px-4 py-8 text-center text-gray-500">No sites match these filters</td></tr>';
+}
+
+async function copyAllInstallsDomains() {
+    const rows = filteredAllInstalls();
+    const statusEl = document.getElementById('allInstallsStatus');
+    if (!rows.length) { statusEl.textContent = 'Nothing to copy'; return; }
+    try {
+        await navigator.clipboard.writeText(rows.map(g => g.host).join('\n'));
+        statusEl.textContent = `Copied ${rows.length} domains`;
+    } catch (e) {
+        statusEl.textContent = 'Clipboard blocked — use Export CSV';
+    }
+}
+
+// One line per install (not per domain) so product-level detail survives.
+function exportAllInstallsCsv() {
+    const rows = filteredAllInstalls();
+    if (!rows.length) { document.getElementById('allInstallsStatus').textContent = 'Nothing to export'; return; }
+    const lines = [['Domain', 'Product', 'Install ID', 'License ID', 'Plan', 'Version', 'Active', 'Installed', 'URL'].join(',')];
+    rows.forEach(g => g.installs.forEach(i => {
+        lines.push([
+            g.host,
+            productLookup[String(i.product_id)] || i.product_id,
+            i.install_id ?? '',
+            i.license_id ?? 'no license',
+            plansCache[i.product_id]?.[String(i.plan_id)]?.title || i.plan_id || '',
+            i.version || '',
+            i.is_active ? 'yes' : 'no',
+            i.created || '',
+            i.url || '',
+        ].map(csvEscape).join(','));
+    }));
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `freemius-all-installs-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+
+// ── No License ──────────────────────────────────────────────────
+// Server-side list (data/unlicensed.json) of sites without a license key.
+// Every Coverage check feeds it: "nokey" and "missing" rows are upserted,
+// rows now seen licensed are dropped.
+
+let unlicensedRows = [];
+
+async function syncUnlicensedFromCoverage() {
+    const found = [];
+    const resolved = [];
+    coverageRows.forEach(r => {
+        const s = coverageStatus(r);
+        if (s === 'nokey' || s === 'missing') {
+            found.push({
+                host: r.host,
+                status: s,
+                product_id: r.fs?.product_id ?? null,
+                install_id: r.fs?.install_id ?? null,
+                version: r.scan?.x2_version || r.fs?.version || null,
+            });
+        } else if (s === 'licensed') {
+            resolved.push(r.host);
+        }
+    });
+    try {
+        const res = await fetch('api.php?action=unlicensed_sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ found, resolved }),
+        }).then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'sync failed');
+        const d = res.data;
+        return ` No License list: +${d.added} new, ${d.updated} updated, ${d.removed} now licensed (${d.total} total).`;
+    } catch (e) {
+        return ` ⚠ Could not update No License list: ${e.message}.`;
+    }
+}
+
+async function loadUnlicensed() {
+    const statusEl = document.getElementById('unlicensedStatus');
+    statusEl.textContent = 'Loading…';
+    try {
+        const res = await fetch('api.php?action=unlicensed_list').then(r => r.json());
+        if (!res.success) throw new Error(res.error || 'load failed');
+        unlicensedRows = res.data || [];
+        statusEl.textContent = '';
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+    }
+    renderUnlicensed();
+}
+
+function filteredUnlicensed() {
+    const filter = document.getElementById('unlicensedFilter').value;
+    const q = document.getElementById('unlicensedSearch').value.trim().toLowerCase();
+    return unlicensedRows
+        .filter(r => (!filter || r.status === filter) && (!q || r.host.includes(q)))
+        .sort((a, b) => a.host.localeCompare(b.host));
+}
+
+function renderUnlicensed() {
+    const counts = { missing: 0, nokey: 0 };
+    unlicensedRows.forEach(r => { if (r.status in counts) counts[r.status]++; });
+    const card = (k, label, n, cls) => `
+        <button onclick="document.getElementById('unlicensedFilter').value='${k}';renderUnlicensed()" class="text-left bg-gray-900 border border-gray-800 hover:border-gray-600 rounded-lg px-4 py-3">
+            <div class="text-2xl font-semibold ${cls}">${n}</div>
+            <div class="text-xs text-gray-400">${label}</div>
+        </button>`;
+    document.getElementById('unlicensedSummary').innerHTML =
+        card('', 'Total without a license', unlicensedRows.length, 'text-gray-100')
+        + card('missing', coverageStatusMeta.missing.label, counts.missing, 'text-red-300')
+        + card('nokey', coverageStatusMeta.nokey.label, counts.nokey, 'text-yellow-300');
+
+    const rows = filteredUnlicensed();
+    const body = document.getElementById('unlicensedBody');
+    if (!unlicensedRows.length) {
+        body.innerHTML = '<tr><td colspan="7" class="px-4 py-8 text-center text-gray-500">Empty — run a Coverage check and unlicensed sites land here.</td></tr>';
+        return;
+    }
+    body.innerHTML = rows.map(r => {
+        const st = coverageStatusMeta[r.status] || coverageStatusMeta.other;
+        const fs = r.install_id
+            ? `#${esc(String(r.install_id))} · ${esc(productLookup[String(r.product_id)] || String(r.product_id ?? ''))}`
+            : '<span class="text-gray-600">—</span>';
+        return `<tr class="hover:bg-gray-800/50">
+            <td class="px-4 py-2"><a href="https://${esc(r.host)}/" target="_blank" rel="noopener" class="text-blue-400 hover:underline">${esc(r.host)}</a></td>
+            <td class="px-4 py-2"><span class="px-2 py-0.5 rounded text-xs whitespace-nowrap ${st.cls}">${st.label}</span></td>
+            <td class="px-4 py-2 text-xs text-gray-300">${fs}</td>
+            <td class="px-4 py-2 text-xs text-gray-300">${esc(r.version || '')}</td>
+            <td class="px-4 py-2 text-xs text-gray-400">${shortDate(r.first_seen)}</td>
+            <td class="px-4 py-2 text-xs text-gray-400">${shortDate(r.last_seen)}</td>
+            <td class="px-4 py-2 text-right"><button onclick="removeUnlicensed('${esc(r.host)}')" class="text-xs text-red-400 hover:text-red-300">Remove</button></td>
+        </tr>`;
+    }).join('') || '<tr><td colspan="7" class="px-4 py-8 text-center text-gray-500">No rows match this filter</td></tr>';
+}
+
+function removeUnlicensed(host) {
+    showConfirm(`Remove ${host} from the No License list? It comes back if a later Coverage check still finds it unlicensed.`, async () => {
+        const body = new URLSearchParams();
+        body.append('hosts[]', host);
+        const statusEl = document.getElementById('unlicensedStatus');
+        try {
+            const res = await fetch('api.php?action=unlicensed_remove', { method: 'POST', body }).then(r => r.json());
+            if (!res.success) throw new Error(res.error || 'remove failed');
+            statusEl.textContent = `Removed ${host}`;
+        } catch (e) {
+            statusEl.textContent = 'Failed: ' + e.message;
+        }
+        loadUnlicensed();
+    });
+}
+
+async function copyUnlicensedDomains() {
+    const rows = filteredUnlicensed();
+    const statusEl = document.getElementById('unlicensedStatus');
+    if (!rows.length) { statusEl.textContent = 'Nothing to copy'; return; }
+    try {
+        await navigator.clipboard.writeText(rows.map(r => r.host).join('\n'));
+        statusEl.textContent = `Copied ${rows.length} domains`;
+    } catch (e) {
+        statusEl.textContent = 'Clipboard blocked — use Export CSV';
+    }
+}
+
+function exportUnlicensedCsv() {
+    const rows = filteredUnlicensed();
+    if (!rows.length) { document.getElementById('unlicensedStatus').textContent = 'Nothing to export'; return; }
+    const lines = [['Domain', 'Reason', 'Install ID', 'Product', 'xpress-2 Version', 'First Seen', 'Last Seen'].join(',')];
+    rows.forEach(r => {
+        lines.push([
+            r.host,
+            (coverageStatusMeta[r.status] || {}).label || r.status,
+            r.install_id ?? '',
+            r.product_id ? (productLookup[String(r.product_id)] || r.product_id) : '',
+            r.version || '',
+            r.first_seen || '',
+            r.last_seen || '',
+        ].map(csvEscape).join(','));
+    });
+    const blob = new Blob([lines.join('\r\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `freemius-no-license-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
 }
 
 function init() {

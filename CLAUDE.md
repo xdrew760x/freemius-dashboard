@@ -29,3 +29,5 @@ Four-file app, no framework, no dependencies:
 - `enriched=true` on `/licenses.json` embeds linked user/plan/subscription; `extended=true` on `/subscriptions.json` embeds plan name, install URL, user email. Both are already used.
 - Pagination `count` is clamped 1–50 server-side; frontend pages at 25.
 - Subscription cancel accepts optional `reason` / `reason_ids` query params.
+- Lower Freemius account plans cap install visibility via the API (e.g. Smart Listing Pro #21348: 100 installs). Past the cap, `/installs.json` returns 403 `insufficient_account_permissions`. `coverage_installs` stops paging and returns the product under `capped`, so its results are incomplete.
+- Freemius only creates an install record once the admin opts in or activates a key. Sites that skipped this are invisible to the API. The Coverage tab diffs a known-domain list (saved in localStorage) against installs from every product and scans each homepage for `/wp-content/themes/xpress-2/`.

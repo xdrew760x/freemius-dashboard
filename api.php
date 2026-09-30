@@ -144,6 +144,143 @@ function fetchList(string $base, string $path, array $query, string $bearer, str
     return $lastRes;
 }
 
+// "https://www.Example.com/foo/" → "example.com". Empty string if it
+// doesn't look like a hostname (keeps coverage_scan from fetching junk).
+function normalizeHost(string $raw): string
+{
+    $raw = strtolower(trim($raw));
+    if ($raw === '') return '';
+    if (!preg_match('#^https?://#', $raw)) $raw = 'http://' . $raw;
+    $host = (string) parse_url($raw, PHP_URL_HOST);
+    $host = preg_replace('/^www\./', '', $host);
+    return preg_match('/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/', $host) ? $host : '';
+}
+
+// Every install of one product, paged 50 at a time. Lower Freemius plans cap
+// API visibility (e.g. 100 installs) and 403 past it — keep what we have and
+// report the cap instead of failing. Returns ['items', 'capped' (null|array), 'error' (null|response)].
+function fetchProductInstalls(array $p, string $base): array
+{
+    $items = [];
+    $o = 0;
+    while (true) {
+        $res = apiRequest("{$base}/products/{$p['id']}/installs.json?count=50&offset={$o}", $p['bearer']);
+        if (!$res['success'] && ($res['data']['error']['code'] ?? '') === 'insufficient_account_permissions') {
+            $capped = ['seen' => $o, 'message' => $res['data']['error']['message'] ?? ''];
+            // The count endpoint isn't capped, so the UI can say "100 of 119".
+            $cnt = apiRequest("{$base}/products/{$p['id']}/installs/count.json", $p['bearer']);
+            if ($cnt['success'] && isset($cnt['data']['count'])) $capped['total'] = (int) $cnt['data']['count'];
+            return ['items' => $items, 'capped' => $capped, 'error' => null];
+        }
+        if (!$res['success']) return ['items' => $items, 'capped' => null, 'error' => $res];
+        $page = $res['data']['installs'] ?? [];
+        array_push($items, ...$page);
+        if (count($page) < 50) break;
+        $o += 50;
+    }
+    return ['items' => $items, 'capped' => null, 'error' => null];
+}
+
+// ── No-license list storage ─────────────────────────────────────
+// Persistent record of sites Coverage found without a license key. Lives in a
+// gitignored JSON file next to the app — it's local state, not Freemius data.
+const UNLICENSED_FILE = __DIR__ . '/data/unlicensed.json';
+
+function loadUnlicensed(): array
+{
+    if (!is_file(UNLICENSED_FILE)) return [];
+    $data = json_decode((string) file_get_contents(UNLICENSED_FILE), true);
+    return is_array($data) ? $data : [];
+}
+
+function saveUnlicensed(array $rows): bool
+{
+    if (!is_dir(dirname(UNLICENSED_FILE)) && !mkdir(dirname(UNLICENSED_FILE), 0755, true)) return false;
+    ksort($rows);
+    return file_put_contents(UNLICENSED_FILE, json_encode($rows, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), LOCK_EX) !== false;
+}
+
+// Parallel GET of many URLs. Returns url → [code, body, final_url, error].
+function multiGet(array $urls, int $timeout = 15): array
+{
+    $mh = curl_multi_init();
+    $handles = [];
+    foreach ($urls as $url) {
+        $ch = curl_init($url);
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_MAXREDIRS      => 5,
+            CURLOPT_TIMEOUT        => $timeout,
+            CURLOPT_CONNECTTIMEOUT => 8,
+            CURLOPT_USERAGENT      => 'Mozilla/5.0 (Macintosh) FreemiusCoverageScan/1.0',
+            CURLOPT_PROTOCOLS      => CURLPROTO_HTTP | CURLPROTO_HTTPS,
+        ]);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$url] = $ch;
+    }
+    do {
+        $status = curl_multi_exec($mh, $running);
+        if ($running) curl_multi_select($mh, 1.0);
+    } while ($running && $status === CURLM_OK);
+
+    $out = [];
+    foreach ($handles as $url => $ch) {
+        $out[$url] = [
+            'code'  => (int) curl_getinfo($ch, CURLINFO_HTTP_CODE),
+            'body'  => (string) curl_multi_getcontent($ch),
+            'final' => (string) curl_getinfo($ch, CURLINFO_EFFECTIVE_URL),
+            'error' => curl_error($ch) ?: (curl_getinfo($ch, CURLINFO_HTTP_CODE) ? '' : 'unreachable (DNS / connect / timeout)'),
+        ];
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+    curl_multi_close($mh);
+    return $out;
+}
+
+// Fetch each host's homepage, list the /wp-content/themes/{slug}/ dirs it
+// references, and for xpress-2 sites read the Version header from style.css.
+function scanSites(array $hosts): array
+{
+    $result = [];
+    if (!$hosts) return $result;
+
+    $pages = multiGet(array_map(fn($h) => "https://{$h}/", $hosts));
+    $cssUrls = [];
+    foreach ($hosts as $h) {
+        $r = $pages["https://{$h}/"];
+        $themes = [];
+        if (preg_match_all('#/wp-content/themes/([a-z0-9._-]+)/#i', $r['body'], $m)) {
+            $themes = array_values(array_unique(array_map('strtolower', $m[1])));
+        }
+        $finalHost = normalizeHost($r['final']);
+        $result[$h] = [
+            'http_code'   => $r['code'],
+            'error'       => $r['error'] ?: null,
+            'final_host'  => $finalHost !== $h ? $finalHost : null,
+            'is_wp'       => stripos($r['body'], '/wp-content/') !== false || stripos($r['body'], '/wp-includes/') !== false,
+            'themes'      => $themes,
+            'xpress2'     => in_array('xpress-2', $themes, true),
+            'x2_version'  => null,
+        ];
+        if ($result[$h]['xpress2']) {
+            $base = $r['final'] ? rtrim(preg_replace('#^(https?://[^/]+).*$#', '$1', $r['final']), '/') : "https://{$h}";
+            $cssUrls[$h] = "{$base}/wp-content/themes/xpress-2/style.css";
+        }
+    }
+
+    if ($cssUrls) {
+        $css = multiGet(array_values($cssUrls), 10);
+        foreach ($cssUrls as $h => $u) {
+            if (preg_match('/^\s*\*?\s*Version:\s*([^\s*]+)/mi', $css[$u]['body'], $m)) {
+                $result[$h]['x2_version'] = $m[1];
+            }
+        }
+    }
+    return $result;
+}
+
 // Pagination defaults
 $count  = min(max((int) ($_GET['count'] ?? 25), 1), 200);
 $offset = max((int) ($_GET['offset'] ?? 0), 0);
@@ -312,6 +449,44 @@ switch ($action) {
         break;
     }
 
+    // ── Coverage: every Freemius install host, across ALL products ──
+    // Sites that never opted in / never entered a key have no install
+    // record, so the Coverage tab diffs this map against a known-domain list.
+    case 'coverage_installs': {
+        $map = [];
+        $capped = []; // product id → installs visible before the plan's view cap hit
+        foreach ($products as $p) {
+            $r = fetchProductInstalls($p, $base);
+            if ($r['error']) { echo json_encode($r['error']); exit; }
+            if ($r['capped']) $capped[(string) $p['id']] = $r['capped'];
+            foreach ($r['items'] as $it) {
+                $host = normalizeHost((string) ($it['url'] ?? ''));
+                if ($host === '') continue;
+                // Keep the most useful record per host: licensed beats unlicensed.
+                if (isset($map[$host]) && $map[$host]['license_id'] && !$it['license_id']) continue;
+                $map[$host] = [
+                    'install_id' => $it['id'] ?? null,
+                    'product_id' => (int) $p['id'],
+                    'license_id' => $it['license_id'] ?? null,
+                    'plan_id'    => $it['plan_id'] ?? null,
+                    'version'    => $it['version'] ?? null,
+                    'is_active'  => !empty($it['is_active']),
+                ];
+            }
+        }
+        echo json_encode(['success' => true, 'data' => $map, 'capped' => $capped]);
+        break;
+    }
+
+    // ── Coverage: fetch each site's homepage and detect the theme ───
+    case 'coverage_scan': {
+        $hosts = $_POST['hosts'] ?? [];
+        if (!is_array($hosts)) $hosts = [];
+        $hosts = array_slice(array_unique(array_filter(array_map('normalizeHost', $hosts))), 0, 25);
+        echo json_encode(['success' => true, 'data' => scanSites($hosts)]);
+        break;
+    }
+
     // ── User detail ─────────────────────────────────────────────────
     case 'get_user':
         $uid = (int) ($_GET['user_id'] ?? 0);
@@ -364,6 +539,90 @@ switch ($action) {
         if (!$iid) { echo json_encode(['success' => false, 'error' => 'Missing install_id']); break; }
         echo json_encode(apiRequest("{$base}/products/{$pid}/installs/{$iid}.json", $bearer, 'DELETE'));
         break;
+
+    // ── All Installs: every install of every product, flat ──────────
+    // The All Installs tab groups these by host client-side. Per-product
+    // errors are reported rather than aborting, so one bad token doesn't
+    // blank the whole view.
+    case 'all_installs': {
+        $out = [];
+        $capped = [];
+        $errors = [];
+        foreach ($products as $p) {
+            $r = fetchProductInstalls($p, $base);
+            if ($r['capped']) $capped[(string) $p['id']] = $r['capped'];
+            if ($r['error']) $errors[(string) $p['id']] = $r['error']['data']['error']['message'] ?? ('HTTP ' . $r['error']['http_code']);
+            foreach ($r['items'] as $it) {
+                $out[] = [
+                    'install_id' => $it['id'] ?? null,
+                    'product_id' => (int) $p['id'],
+                    'host'       => normalizeHost((string) ($it['url'] ?? '')),
+                    'url'        => $it['url'] ?? '',
+                    'user_id'    => $it['user_id'] ?? null,
+                    'license_id' => $it['license_id'] ?? null,
+                    'plan_id'    => $it['plan_id'] ?? null,
+                    'version'    => $it['version'] ?? null,
+                    'is_active'  => !empty($it['is_active']),
+                    'is_premium' => !empty($it['is_premium']),
+                    'created'    => $it['created'] ?? null,
+                ];
+            }
+        }
+        echo json_encode(['success' => true, 'data' => $out, 'capped' => $capped, 'errors' => $errors]);
+        break;
+    }
+
+    // ── No-license list ─────────────────────────────────────────────
+    case 'unlicensed_list': {
+        echo json_encode(['success' => true, 'data' => array_values(loadUnlicensed())]);
+        break;
+    }
+
+    // POST JSON {found: [{host, status, product_id, install_id, version}], resolved: [host]}.
+    // `found` rows are upserted (first_seen kept); `resolved` hosts — ones the
+    // latest scan saw licensed — drop off the list.
+    case 'unlicensed_sync': {
+        $in = json_decode((string) file_get_contents('php://input'), true);
+        if (!is_array($in)) { echo json_encode(['success' => false, 'error' => 'Invalid JSON body']); break; }
+        $rows = loadUnlicensed();
+        $now = gmdate('c');
+        $added = $updated = $removed = 0;
+        foreach ((array) ($in['found'] ?? []) as $f) {
+            $host = normalizeHost((string) ($f['host'] ?? ''));
+            $status = (string) ($f['status'] ?? '');
+            if ($host === '' || !in_array($status, ['nokey', 'missing'], true)) continue;
+            isset($rows[$host]) ? $updated++ : $added++;
+            $rows[$host] = [
+                'host'       => $host,
+                'status'     => $status,
+                'product_id' => isset($f['product_id']) ? (int) $f['product_id'] : null,
+                'install_id' => isset($f['install_id']) ? (int) $f['install_id'] : null,
+                'version'    => isset($f['version']) ? (string) $f['version'] : null,
+                'first_seen' => $rows[$host]['first_seen'] ?? $now,
+                'last_seen'  => $now,
+            ];
+        }
+        foreach ((array) ($in['resolved'] ?? []) as $h) {
+            $host = normalizeHost((string) $h);
+            if ($host !== '' && isset($rows[$host])) { unset($rows[$host]); $removed++; }
+        }
+        if (!saveUnlicensed($rows)) { echo json_encode(['success' => false, 'error' => 'Could not write ' . UNLICENSED_FILE]); break; }
+        echo json_encode(['success' => true, 'data' => compact('added', 'updated', 'removed') + ['total' => count($rows)]]);
+        break;
+    }
+
+    case 'unlicensed_remove': {
+        $hosts = $_POST['hosts'] ?? [];
+        $rows = loadUnlicensed();
+        $removed = 0;
+        foreach ((array) $hosts as $h) {
+            $host = normalizeHost((string) $h);
+            if ($host !== '' && isset($rows[$host])) { unset($rows[$host]); $removed++; }
+        }
+        if (!saveUnlicensed($rows)) { echo json_encode(['success' => false, 'error' => 'Could not write ' . UNLICENSED_FILE]); break; }
+        echo json_encode(['success' => true, 'data' => ['removed' => $removed, 'total' => count($rows)]]);
+        break;
+    }
 
     default:
         echo json_encode(['success' => false, 'error' => 'Unknown action']);
